@@ -73,9 +73,11 @@ jobs:
           mkdir "$w0"
           git -C "$w0" init --quiet
           git -C "$w0" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
-          git -C "$w0" -c "http.extraheader=AUTHORIZATION: bearer $FETCH_TOKEN" \
+          auth_header="$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth_header"
+          git -C "$w0" -c "http.extraheader=AUTHORIZATION: basic $auth_header" \
             fetch --quiet --no-tags --depth=1 origin "$GITHUB_SHA"
-          unset FETCH_TOKEN
+          unset FETCH_TOKEN auth_header
           git -C "$w0" checkout --quiet --detach FETCH_HEAD
           test "$(git -C "$w0" rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git -C "$w0" status --porcelain --untracked-files=all)"

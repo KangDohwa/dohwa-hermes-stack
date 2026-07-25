@@ -32,6 +32,9 @@ _PINNED_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _CI_REQUEST_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _REVIEW_CONTEXT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:/-]{1,256}$")
+_FULL_HEAD_REF_PATTERN = re.compile(
+    r"^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,243}$"
+)
 _WORKFLOW_PATH_PATTERN = re.compile(
     r"^\.github/workflows/[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$"
 )
@@ -42,6 +45,7 @@ class WorkflowIdentity:
     path: str
     revision: str
     definition_sha256: str
+    dispatch_ref: str
 
     def __post_init__(self) -> None:
         if (
@@ -60,6 +64,21 @@ class WorkflowIdentity:
         ):
             raise ValueError(
                 "workflow definition SHA-256 must be 64 lowercase hexadecimal characters"
+            )
+        if (
+            not isinstance(self.dispatch_ref, str)
+            or _FULL_HEAD_REF_PATTERN.fullmatch(self.dispatch_ref) is None
+            or ".." in self.dispatch_ref
+            or "//" in self.dispatch_ref
+            or "@{" in self.dispatch_ref
+            or self.dispatch_ref.endswith((".", "/", ".lock"))
+            or any(
+                part.startswith(".") or part.endswith(".lock")
+                for part in self.dispatch_ref.removeprefix("refs/heads/").split("/")
+            )
+        ):
+            raise ValueError(
+                "dispatch_ref must be an exact canonical refs/heads reference"
             )
 
 
@@ -271,11 +290,31 @@ class GitHubClient:
                 "dispatch identity does not match the approved workflow W0 and digest",
             )
         normalized_inputs = self._validate_workflow_dispatch_inputs(inputs)
+        dispatch_ref_name = identity.dispatch_ref.removeprefix("refs/")
+        dispatch_ref = self._request(
+            canonical,
+            "GET",
+            f"{self._repo_path(canonical)}/git/ref/"
+            f"{parse.quote(dispatch_ref_name, safe='/')}",
+        )
+        ref_object = (
+            dispatch_ref.get("object") if isinstance(dispatch_ref, dict) else None
+        )
+        if (
+            dispatch_ref.get("ref") != identity.dispatch_ref
+            or not isinstance(ref_object, dict)
+            or ref_object.get("type") != "commit"
+            or ref_object.get("sha") != identity.revision
+        ):
+            self._ci_error(
+                "IMMUTABLE_WORKFLOW_REF_MISMATCH",
+                "dispatch ref does not resolve to the approved workflow W0",
+            )
         self._request(
             canonical,
             "POST",
             f"{self._repo_path(canonical)}/actions/workflows/{validated_id}/dispatches",
-            body={"ref": revision, "inputs": normalized_inputs},
+            body={"ref": identity.dispatch_ref, "inputs": normalized_inputs},
             expected_statuses=(204,),
         )
 
@@ -581,7 +620,9 @@ class GitHubClient:
             and str(run_repository.get("full_name") or "").casefold()
             == canonical.casefold()
             and run.get("workflow_id") == workflow_id
-            and run.get("path") == f"{identity.path}@{identity.revision}"
+            and run.get("path") == identity.path
+            and run.get("head_branch")
+            == identity.dispatch_ref.removeprefix("refs/heads/")
             and run.get("head_sha") == identity.revision
             and lower_bound <= created_at <= upper_bound
             and not isinstance(run_attempt, bool)
