@@ -1,0 +1,511 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import json
+from pathlib import Path
+import sqlite3
+import tempfile
+import unittest
+
+from reviewer.approval import (
+    ReviewAttemptStatus,
+    ReviewContextContent,
+    new_uuid7,
+    require_uuid7,
+)
+from reviewer.models import ReviewState, WebhookEvent
+from reviewer.state import StateStore
+
+
+def pull_event(delivery_id: str) -> WebhookEvent:
+    return WebhookEvent(
+        delivery_id=delivery_id,
+        event_name="pull_request",
+        action="opened",
+        repository_id=42,
+        repository="example/example-repo",
+        installation_id=99,
+        pull_number=7,
+        base_sha="b" * 40,
+        head_sha="a" * 40,
+        is_draft=False,
+        is_merged=False,
+        merge_sha=None,
+    )
+
+
+def review_context(**overrides: object) -> ReviewContextContent:
+    values: dict[str, object] = {
+        "repository_id": 42,
+        "pull_number": 7,
+        "base_sha": "b" * 40,
+        "head_sha": "a" * 40,
+        "merge_base_sha": "c" * 40,
+        "diff_sha256": "d" * 64,
+        "policy_version": "phase3-v1",
+    }
+    values.update(overrides)
+    return ReviewContextContent(**values)
+
+
+class ReviewContextTests(unittest.TestCase):
+    def test_golden_vector_field_order_digest_and_uuid7(self):
+        value = ReviewContextContent(
+            repository_id=1,
+            pull_number=1,
+            base_sha="1" * 40,
+            head_sha="0" * 40,
+            merge_base_sha="2" * 40,
+            diff_sha256="3" * 64,
+            policy_version="phase3-v1",
+        )
+        expected = (
+            b'{"base_sha":"1111111111111111111111111111111111111111",'
+            b'"diff_sha256":"3333333333333333333333333333333333333333333333333333333333333333",'
+            b'"head_sha":"0000000000000000000000000000000000000000",'
+            b'"merge_base_sha":"2222222222222222222222222222222222222222",'
+            b'"policy_version":"phase3-v1","pull_number_decimal":"1",'
+            b'"repository_id_decimal":"1",'
+            b'"schema":"dohwa-review-context-content/v1"}'
+        )
+        self.assertEqual(expected, value.canonical_bytes)
+        self.assertEqual(
+            "912089101b1b9f74dbaef4526ec9a2e50db7ffcef7859cbcc8bffa92510b76ee",
+            value.content_id,
+        )
+        self.assertNotEqual(
+            value.content_id, replace(value, policy_version="phase3-v2").content_id
+        )
+        self.assertEqual(
+            value,
+            ReviewContextContent.from_canonical_bytes(value.canonical_bytes),
+        )
+        identifier = new_uuid7(timestamp_ms=1, random_bits=0)
+        self.assertEqual(identifier, require_uuid7(identifier, "identifier"))
+
+    def test_missing_extra_duplicate_and_noncanonical_order_are_rejected(self):
+        value = review_context()
+        payload = value.payload
+        missing = dict(payload)
+        missing.pop("base_sha")
+        extra = dict(payload, extra="value")
+        duplicate = value.canonical_bytes.replace(
+            b'{"base_sha":', b'{"base_sha":"b","base_sha":', 1
+        )
+        reordered = json.dumps(
+            dict(reversed(tuple(payload.items()))),
+            separators=(",", ":"),
+        ).encode()
+        cases = (
+            json.dumps(missing, separators=(",", ":"), sort_keys=True).encode(),
+            json.dumps(extra, separators=(",", ":"), sort_keys=True).encode(),
+            duplicate,
+            reordered,
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    ReviewContextContent.from_canonical_bytes(raw)
+
+    def test_decimal_policy_and_digest_validation_is_strict(self):
+        value = review_context()
+        for field, invalid in (
+            ("repository_id_decimal", "01"),
+            ("pull_number_decimal", "0"),
+            ("pull_number_decimal", "+1"),
+        ):
+            payload = value.payload
+            payload[field] = invalid
+            raw = json.dumps(
+                payload, separators=(",", ":"), sort_keys=True
+            ).encode()
+            with self.subTest(field=field, invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "decimal"):
+                    ReviewContextContent.from_canonical_bytes(raw)
+        with self.assertRaisesRegex(ValueError, "policy_version"):
+            review_context(policy_version="\ud654")
+        with self.assertRaisesRegex(ValueError, "diff_sha256"):
+            review_context(diff_sha256="D" * 64)
+        maximum = review_context(
+            repository_id=2**63 - 1,
+            pull_number=2**63 - 1,
+        )
+        self.assertEqual(maximum, ReviewContextContent.from_canonical_bytes(
+            maximum.canonical_bytes
+        ))
+        for field in ("repository_id", "pull_number"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "signed 64-bit"):
+                    review_context(**{field: 2**63})
+
+
+class ReviewAttemptStateTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temporary_directory.name) / "state.sqlite3"
+        self.store = StateStore(self.db_path)
+        self.job = self.store.ingest(pull_event("opened")).job
+        self.context = self.store.store_review_context(review_context())
+
+    def tearDown(self):
+        self.store.close()
+        self.temporary_directory.cleanup()
+
+    def test_additive_schema_keeps_v1_old_reader_and_scope(self):
+        version = self.store._connection.execute(
+            "SELECT version FROM schema_metadata"
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in self.store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        self.assertEqual(1, version)
+        self.assertIn("review_context_contents", tables)
+        self.assertIn("review_attempts", tables)
+        self.assertFalse(
+            {
+                "github_label_events",
+                "github_label_webhook_evidence",
+                "approvals",
+                "approval_transition_audit",
+            }
+            & tables
+        )
+
+        self.store.close()
+        with sqlite3.connect(self.db_path) as old_reader:
+            self.assertEqual(
+                (1, ReviewState.QUEUED.value),
+                old_reader.execute(
+                    """
+                    SELECT m.version, j.state
+                    FROM schema_metadata m CROSS JOIN review_jobs j
+                    WHERE j.id = ?
+                    """,
+                    (self.job.id,),
+                ).fetchone(),
+            )
+        self.store = StateStore(self.db_path)
+
+    def test_prepare_is_idempotent_per_job_and_restart_durable(self):
+        first = self.store.prepare_review_attempt(
+            job_id=self.job.id,
+            content_id=self.context.content_id,
+        )
+        same = self.store.prepare_review_attempt(
+            job_id=self.job.id,
+            content_id=self.context.content_id,
+        )
+        self.assertEqual(first, same)
+        self.assertEqual(ReviewAttemptStatus.PREPARED, first.status)
+
+        other_content = self.store.store_review_context(
+            review_context(diff_sha256="e" * 64)
+        )
+        with self.assertRaisesRegex(RuntimeError, "open review attempt"):
+            self.store.prepare_review_attempt(
+                job_id=self.job.id,
+                content_id=other_content.content_id,
+            )
+
+        self.store.close()
+        self.store = StateStore(self.db_path)
+        self.assertEqual(
+            first,
+            self.store.get_review_attempt(first.review_context_id),
+        )
+
+    def test_activation_revalidates_job_context_and_state(self):
+        attempt = self.store.prepare_review_attempt(
+            job_id=self.job.id,
+            content_id=self.context.content_id,
+        )
+        self.store._connection.execute(
+            "UPDATE review_jobs SET base_sha = ? WHERE id = ?",
+            ("f" * 40, self.job.id),
+        )
+        with self.assertRaisesRegex(RuntimeError, "no longer matches"):
+            self.store.activate_review_attempt(
+                attempt.review_context_id,
+                github_review_id=9001,
+                submitted_at="2026-07-25T00:00:00Z",
+            )
+
+        self.store._connection.execute(
+            "UPDATE review_jobs SET base_sha = ?, state = 'CLOSED' WHERE id = ?",
+            ("b" * 40, self.job.id),
+        )
+        with self.assertRaisesRegex(RuntimeError, "no longer active"):
+            self.store.activate_review_attempt(
+                attempt.review_context_id,
+                github_review_id=9001,
+                submitted_at="2026-07-25T00:00:00Z",
+            )
+
+    def test_lifecycle_updates_require_state_store_and_are_terminal(self):
+        attempt = self.store.prepare_review_attempt(
+            job_id=self.job.id,
+            content_id=self.context.content_id,
+        )
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "StateStore-managed"
+        ):
+            self.store._connection.execute(
+                """
+                UPDATE review_attempts
+                SET status = 'ACTIVE', github_review_id = 9,
+                    submitted_at = '2026-07-25T00:00:00Z',
+                    activated_at = 'now'
+                WHERE review_context_id = ?
+                """,
+                (attempt.review_context_id,),
+            )
+
+        active = self.store.activate_review_attempt(
+            attempt.review_context_id,
+            github_review_id=9001,
+            submitted_at="2026-07-25T00:00:00Z",
+        )
+        self.assertEqual(ReviewAttemptStatus.ACTIVE, active.status)
+        terminal = self.store.invalidate_review_attempt(
+            active.review_context_id, reason="CONTEXT_CHANGED"
+        )
+        self.assertEqual(ReviewAttemptStatus.INVALIDATED, terminal.status)
+        with self.assertRaisesRegex(RuntimeError, "terminal"):
+            self.store.activate_review_attempt(
+                active.review_context_id,
+                github_review_id=9001,
+                submitted_at="2026-07-25T00:00:00Z",
+            )
+
+    def test_concurrent_prepare_returns_one_attempt(self):
+        other = StateStore(self.db_path)
+
+        def prepare(store):
+            return store.prepare_review_attempt(
+                job_id=self.job.id,
+                content_id=self.context.content_id,
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                attempts = list(executor.map(prepare, (self.store, other)))
+        finally:
+            other.close()
+        self.assertEqual(
+            attempts[0].review_attempt_id,
+            attempts[1].review_attempt_id,
+        )
+        self.assertEqual(
+            1,
+            self.store._connection.execute(
+                "SELECT COUNT(*) FROM review_attempts"
+            ).fetchone()[0],
+        )
+
+    def test_direct_insert_is_blocked_for_every_lifecycle_status(self):
+        for status, lifecycle in (
+            ("PREPARED", (None, None, None, None, None)),
+            (
+                "ACTIVE",
+                (
+                    9001,
+                    "2026-07-25T00:00:00Z",
+                    "2026-07-25T00:00:01Z",
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "INVALIDATED",
+                (
+                    None,
+                    None,
+                    None,
+                    "2026-07-25T00:00:01Z",
+                    "DIRECT_INJECTION",
+                ),
+            ),
+        ):
+            attempt_id = new_uuid7()
+            with self.subTest(status=status):
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError, "StateStore-managed"
+                ):
+                    self.store._connection.execute(
+                        """
+                        INSERT INTO review_attempts(
+                            review_attempt_id, review_context_id, job_id,
+                            content_id, repository_id, pull_number, status,
+                            github_review_id, submitted_at, prepared_at,
+                            activated_at, invalidated_at, invalidation_reason
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            attempt_id,
+                            f"dohwa-review-context-attempt/v1:{attempt_id}",
+                            self.job.id,
+                            self.context.content_id,
+                            42,
+                            7,
+                            status,
+                            lifecycle[0],
+                            lifecycle[1],
+                            "2026-07-25T00:00:00Z",
+                            lifecycle[2],
+                            lifecycle[3],
+                            lifecycle[4],
+                        ),
+                    )
+
+    def test_arbitrary_transaction_does_not_authorize_lifecycle_update(self):
+        attempt = self.store.prepare_review_attempt(
+            job_id=self.job.id,
+            content_id=self.context.content_id,
+        )
+        with self.store._transaction() as db:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "StateStore-managed"
+            ):
+                db.execute(
+                    """
+                    UPDATE review_attempts
+                    SET status = 'INVALIDATED', invalidated_at = 'now',
+                        invalidation_reason = 'DIRECT_UPDATE'
+                    WHERE review_context_id = ?
+                    """,
+                    (attempt.review_context_id,),
+                )
+        self.assertEqual(
+            ReviewAttemptStatus.PREPARED,
+            self.store.get_review_attempt(attempt.review_context_id).status,
+        )
+
+    def test_draft_and_close_events_invalidate_open_attempts(self):
+        prepared = self.store.prepare_review_attempt(
+            job_id=self.job.id,
+            content_id=self.context.content_id,
+        )
+        self.store.ingest(
+            replace(
+                pull_event("draft"),
+                action="converted_to_draft",
+                is_draft=True,
+            )
+        )
+        invalidated = self.store.get_review_attempt(prepared.review_context_id)
+        self.assertEqual(ReviewAttemptStatus.INVALIDATED, invalidated.status)
+        self.assertEqual("JOB_WAITING_READY", invalidated.invalidation_reason)
+        with self.assertRaisesRegex(RuntimeError, "no longer active"):
+            self.store.prepare_review_attempt(
+                job_id=self.job.id,
+                content_id=self.context.content_id,
+            )
+
+        reopened = self.store.ingest(
+            replace(pull_event("ready"), action="ready_for_review")
+        ).job
+        active = self.store.activate_review_attempt(
+            self.store.prepare_review_attempt(
+                job_id=reopened.id,
+                content_id=self.context.content_id,
+            ).review_context_id,
+            github_review_id=9001,
+            submitted_at="2026-07-25T00:00:00Z",
+        )
+        self.store.ingest(
+            replace(
+                pull_event("closed"),
+                action="closed",
+                is_merged=False,
+            )
+        )
+        closed_attempt = self.store.get_review_attempt(active.review_context_id)
+        self.assertEqual(ReviewAttemptStatus.INVALIDATED, closed_attempt.status)
+        self.assertEqual("JOB_CLOSED", closed_attempt.invalidation_reason)
+
+    def test_synchronize_invalidates_old_head_and_unblocks_new_head(self):
+        old_attempt = self.store.prepare_review_attempt(
+            job_id=self.job.id,
+            content_id=self.context.content_id,
+        )
+        new_head = "f" * 40
+        discovered = self.store.ingest(
+            replace(
+                pull_event("discovered-new-head"),
+                action="labeled",
+                head_sha=new_head,
+            )
+        ).job
+        new_job = self.store.transition(discovered.id, ReviewState.QUEUED)
+        new_context = self.store.store_review_context(
+            review_context(head_sha=new_head, diff_sha256="e" * 64)
+        )
+        with self.assertRaisesRegex(RuntimeError, "open review attempt"):
+            self.store.prepare_review_attempt(
+                job_id=new_job.id,
+                content_id=new_context.content_id,
+            )
+
+        synchronized = self.store.ingest(
+            replace(
+                pull_event("synchronize"),
+                action="synchronize",
+                head_sha=new_head,
+            )
+        ).job
+        self.assertEqual(new_job.id, synchronized.id)
+        invalidated = self.store.get_review_attempt(old_attempt.review_context_id)
+        self.assertEqual(ReviewAttemptStatus.INVALIDATED, invalidated.status)
+        self.assertEqual(
+            "JOB_OBSOLETE_NEW_HEAD", invalidated.invalidation_reason
+        )
+        replacement = self.store.prepare_review_attempt(
+            job_id=new_job.id,
+            content_id=new_context.content_id,
+        )
+        self.assertEqual(ReviewAttemptStatus.PREPARED, replacement.status)
+
+    def test_terminal_transition_invalidates_active_attempt_in_same_transaction(self):
+        reviewing = self.store.transition(
+            self.job.id,
+            ReviewState.REVIEWING,
+            expected=ReviewState.QUEUED,
+        )
+        active = self.store.activate_review_attempt(
+            self.store.prepare_review_attempt(
+                job_id=reviewing.id,
+                content_id=self.context.content_id,
+            ).review_context_id,
+            github_review_id=9001,
+            submitted_at="2026-07-25T00:00:00Z",
+        )
+        self.store.transition(
+            reviewing.id,
+            ReviewState.HUMAN_REVIEW,
+            expected=ReviewState.REVIEWING,
+        )
+        invalidated = self.store.get_review_attempt(active.review_context_id)
+        self.assertEqual(ReviewAttemptStatus.INVALIDATED, invalidated.status)
+        self.assertEqual("JOB_HUMAN_REVIEW", invalidated.invalidation_reason)
+
+    def test_restart_requeue_preserves_prepared_attempt(self):
+        reviewing = self.store.transition(
+            self.job.id,
+            ReviewState.REVIEWING,
+            expected=ReviewState.QUEUED,
+        )
+        attempt = self.store.prepare_review_attempt(
+            job_id=reviewing.id,
+            content_id=self.context.content_id,
+        )
+        report = self.store.recover_after_restart()
+        self.assertIn(reviewing.id, report.requeued_job_ids)
+        recovered = self.store.get_review_attempt(attempt.review_context_id)
+        self.assertEqual(ReviewAttemptStatus.PREPARED, recovered.status)
+
+if __name__ == "__main__":
+    unittest.main()

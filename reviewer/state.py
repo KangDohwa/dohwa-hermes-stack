@@ -8,6 +8,15 @@ import re
 import sqlite3
 import threading
 
+from reviewer.approval import (
+    REVIEW_CONTEXT_ALGORITHM,
+    ReviewAttempt,
+    ReviewAttemptStatus,
+    ReviewContextContent,
+    StoredReviewContext,
+    new_uuid7,
+    require_uuid7,
+)
 from reviewer.merge_descriptor import CIRequestInputs, MergeDescriptor
 from reviewer.models import (
     ACTIVE_STATES,
@@ -31,12 +40,20 @@ class StateStore:
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
+        self._review_attempt_write = threading.local()
         self._connection = sqlite3.connect(
             self.path,
             isolation_level=None,
             check_same_thread=False,
         )
         self._connection.row_factory = sqlite3.Row
+        self._connection.create_function(
+            "state_store_review_attempt_write_allowed",
+            0,
+            lambda: int(
+                getattr(self._review_attempt_write, "depth", 0) > 0
+            ),
+        )
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.execute("PRAGMA journal_mode = WAL")
@@ -63,6 +80,15 @@ class StateStore:
                 raise
             else:
                 self._connection.commit()
+
+    @contextmanager
+    def _allow_review_attempt_write(self) -> Iterator[None]:
+        depth = getattr(self._review_attempt_write, "depth", 0)
+        self._review_attempt_write.depth = depth + 1
+        try:
+            yield
+        finally:
+            self._review_attempt_write.depth = depth
 
     def _migrate(self) -> None:
         with self._transaction() as db:
@@ -248,6 +274,125 @@ class StateStore:
                 ON ci_requests(descriptor_id, created_at)
             """,
             """
+            CREATE TABLE IF NOT EXISTS review_context_contents (
+                content_id TEXT PRIMARY KEY
+                    CHECK(length(content_id) = 64 AND content_id NOT GLOB '*[^0-9a-f]*'),
+                algorithm_id TEXT NOT NULL
+                    CHECK(algorithm_id = 'dohwa-bot/review-context-content/v1'),
+                canonical_payload BLOB NOT NULL CHECK(typeof(canonical_payload) = 'blob'),
+                repository_id INTEGER NOT NULL CHECK(repository_id > 0),
+                pull_number INTEGER NOT NULL CHECK(pull_number > 0),
+                base_sha TEXT NOT NULL
+                    CHECK(length(base_sha) = 40 AND base_sha NOT GLOB '*[^0-9a-f]*'),
+                head_sha TEXT NOT NULL
+                    CHECK(length(head_sha) = 40 AND head_sha NOT GLOB '*[^0-9a-f]*'),
+                merge_base_sha TEXT NOT NULL
+                    CHECK(length(merge_base_sha) = 40 AND merge_base_sha NOT GLOB '*[^0-9a-f]*'),
+                diff_sha256 TEXT NOT NULL
+                    CHECK(length(diff_sha256) = 64 AND diff_sha256 NOT GLOB '*[^0-9a-f]*'),
+                policy_version TEXT NOT NULL CHECK(length(policy_version) BETWEEN 1 AND 64),
+                created_at TEXT NOT NULL,
+                UNIQUE(algorithm_id, canonical_payload)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS review_attempts (
+                review_attempt_id TEXT PRIMARY KEY,
+                review_context_id TEXT NOT NULL UNIQUE,
+                job_id INTEGER NOT NULL REFERENCES review_jobs(id),
+                content_id TEXT NOT NULL REFERENCES review_context_contents(content_id),
+                repository_id INTEGER NOT NULL CHECK(repository_id > 0),
+                pull_number INTEGER NOT NULL CHECK(pull_number > 0),
+                status TEXT NOT NULL CHECK(status IN ('PREPARED', 'ACTIVE', 'INVALIDATED')),
+                github_review_id INTEGER,
+                submitted_at TEXT,
+                prepared_at TEXT NOT NULL,
+                activated_at TEXT,
+                invalidated_at TEXT,
+                invalidation_reason TEXT,
+                UNIQUE(review_context_id, content_id),
+                CHECK(
+                    (status = 'PREPARED'
+                        AND github_review_id IS NULL AND submitted_at IS NULL
+                        AND activated_at IS NULL AND invalidated_at IS NULL
+                        AND invalidation_reason IS NULL)
+                    OR (status = 'ACTIVE'
+                        AND github_review_id > 0 AND submitted_at IS NOT NULL
+                        AND activated_at IS NOT NULL AND invalidated_at IS NULL
+                        AND invalidation_reason IS NULL)
+                    OR (status = 'INVALIDATED'
+                        AND invalidated_at IS NOT NULL AND length(invalidation_reason) > 0)
+                )
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_review_attempts_open_pull
+                ON review_attempts(repository_id, pull_number)
+                WHERE status IN ('PREPARED', 'ACTIVE')
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_review_attempts_open_job
+                ON review_attempts(job_id)
+                WHERE status IN ('PREPARED', 'ACTIVE')
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_review_attempts_github_review
+                ON review_attempts(repository_id, github_review_id)
+                WHERE github_review_id IS NOT NULL
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS review_context_contents_no_update
+            BEFORE UPDATE ON review_context_contents BEGIN
+                SELECT RAISE(ABORT, 'review context content is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS review_context_contents_no_delete
+            BEFORE DELETE ON review_context_contents BEGIN
+                SELECT RAISE(ABORT, 'review context content is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS review_attempts_no_direct_insert
+            BEFORE INSERT ON review_attempts
+            WHEN state_store_review_attempt_write_allowed() != 1
+            BEGIN
+                SELECT RAISE(ABORT, 'review attempt insert is StateStore-managed');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS review_attempts_identity_no_update
+            BEFORE UPDATE OF review_attempt_id, review_context_id, job_id, content_id,
+                repository_id, pull_number, prepared_at ON review_attempts BEGIN
+                SELECT RAISE(ABORT, 'review attempt identity is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS review_attempts_lifecycle_no_direct_update
+            BEFORE UPDATE OF status, github_review_id, submitted_at, activated_at,
+                invalidated_at, invalidation_reason ON review_attempts
+            WHEN state_store_review_attempt_write_allowed() != 1
+            BEGIN
+                SELECT RAISE(ABORT, 'review attempt lifecycle is StateStore-managed');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS review_attempts_transition_guard
+            BEFORE UPDATE OF status ON review_attempts
+            WHEN NOT (
+                (OLD.status = 'PREPARED' AND NEW.status IN ('ACTIVE', 'INVALIDATED'))
+                OR (OLD.status = 'ACTIVE' AND NEW.status = 'INVALIDATED')
+            ) BEGIN
+                SELECT RAISE(ABORT, 'invalid review attempt transition');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS review_attempts_no_delete
+            BEFORE DELETE ON review_attempts BEGIN
+                SELECT RAISE(ABORT, 'review attempt is durable');
+            END
+            """,
+            """
             CREATE TRIGGER IF NOT EXISTS merge_descriptors_no_update
             BEFORE UPDATE ON merge_descriptors
             BEGIN
@@ -424,6 +569,15 @@ class StateStore:
                     (event.merge_sha, now, now, job_id),
                 )
 
+            persisted = db.execute(
+                "SELECT state FROM review_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            self._invalidate_if_job_left_review_context(
+                db,
+                job_id,
+                ReviewState(persisted["state"]),
+                now=now,
+            )
             db.execute(
                 "UPDATE webhook_deliveries SET job_id = ? WHERE delivery_id = ?",
                 (job_id, event.delivery_id),
@@ -656,6 +810,228 @@ class StateStore:
             raise RuntimeError("stored CI request identity mismatch")
         return _ci_request_from_row(row)
 
+    def store_review_context(
+        self, value: ReviewContextContent
+    ) -> StoredReviewContext:
+        canonical_bytes = value.canonical_bytes
+        parsed = ReviewContextContent.from_canonical_bytes(canonical_bytes)
+        if parsed.content_id != value.content_id:
+            raise ValueError("review context digest mismatch")
+        now = _timestamp()
+        with self._transaction() as db:
+            inserted = db.execute(
+                """
+                INSERT OR IGNORE INTO review_context_contents(
+                    content_id, algorithm_id, canonical_payload, repository_id,
+                    pull_number, base_sha, head_sha, merge_base_sha,
+                    diff_sha256, policy_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    value.content_id,
+                    REVIEW_CONTEXT_ALGORITHM,
+                    sqlite3.Binary(canonical_bytes),
+                    value.repository_id,
+                    value.pull_number,
+                    value.base_sha,
+                    value.head_sha,
+                    value.merge_base_sha,
+                    value.diff_sha256,
+                    value.policy_version,
+                    now,
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM review_context_contents WHERE content_id = ?",
+                (value.content_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("review context insert did not persist")
+            if inserted.rowcount == 0 and (
+                row["algorithm_id"] != REVIEW_CONTEXT_ALGORITHM
+                or bytes(row["canonical_payload"]) != canonical_bytes
+            ):
+                raise RuntimeError("review context digest collision")
+        return _stored_review_context_from_row(row)
+
+    def get_review_context(self, content_id: str) -> StoredReviewContext | None:
+        if _SHA256.fullmatch(content_id) is None:
+            raise ValueError("content_id must be a lowercase SHA-256")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM review_context_contents WHERE content_id = ?",
+                (content_id,),
+            ).fetchone()
+        return _stored_review_context_from_row(row) if row else None
+
+    def prepare_review_attempt(
+        self,
+        *,
+        job_id: int,
+        content_id: str,
+    ) -> ReviewAttempt:
+        if _SHA256.fullmatch(content_id) is None:
+            raise ValueError("content_id must be a lowercase SHA-256")
+        with self._transaction() as db:
+            job = db.execute(
+                "SELECT * FROM review_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            content = db.execute(
+                "SELECT * FROM review_context_contents WHERE content_id = ?",
+                (content_id,),
+            ).fetchone()
+            if job is None:
+                raise KeyError(f"unknown review job: {job_id}")
+            if content is None:
+                raise KeyError(f"unknown review context content: {content_id}")
+            _validate_review_job_context(job, content)
+            existing = db.execute(
+                """
+                SELECT * FROM review_attempts
+                WHERE repository_id = ? AND pull_number = ?
+                  AND status IN ('PREPARED', 'ACTIVE')
+                """,
+                (content["repository_id"], content["pull_number"]),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["job_id"] == job_id
+                    and existing["content_id"] == content_id
+                ):
+                    return _review_attempt_from_row(existing)
+                raise RuntimeError(
+                    "pull request already has an open review attempt"
+                )
+            attempt_id = new_uuid7()
+            context_id = f"dohwa-review-context-attempt/v1:{attempt_id}"
+            prepared_at = _timestamp()
+            with self._allow_review_attempt_write():
+                db.execute(
+                    """
+                    INSERT INTO review_attempts(
+                        review_attempt_id, review_context_id, job_id, content_id,
+                        repository_id, pull_number, status, prepared_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'PREPARED', ?)
+                    """,
+                    (
+                        attempt_id,
+                        context_id,
+                        job_id,
+                        content_id,
+                        content["repository_id"],
+                        content["pull_number"],
+                        prepared_at,
+                    ),
+                )
+            row = db.execute(
+                "SELECT * FROM review_attempts WHERE review_attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        return _review_attempt_from_row(row)
+
+    def get_review_attempt(self, review_context_id: str) -> ReviewAttempt | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM review_attempts WHERE review_context_id = ?",
+                (review_context_id,),
+            ).fetchone()
+        return _review_attempt_from_row(row) if row else None
+
+    def activate_review_attempt(
+        self,
+        review_context_id: str,
+        *,
+        github_review_id: int,
+        submitted_at: str,
+    ) -> ReviewAttempt:
+        if (
+            isinstance(github_review_id, bool)
+            or not isinstance(github_review_id, int)
+            or github_review_id <= 0
+        ):
+            raise ValueError("github_review_id must be a positive integer")
+        _require_github_timestamp(submitted_at, "submitted_at")
+        now = _timestamp()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM review_attempts WHERE review_context_id = ?",
+                (review_context_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown review context: {review_context_id}")
+            job = db.execute(
+                "SELECT * FROM review_jobs WHERE id = ?", (row["job_id"],)
+            ).fetchone()
+            content = db.execute(
+                "SELECT * FROM review_context_contents WHERE content_id = ?",
+                (row["content_id"],),
+            ).fetchone()
+            if job is None or content is None:
+                raise RuntimeError("review attempt dependencies are missing")
+            _validate_review_job_context(job, content)
+            if row["status"] == ReviewAttemptStatus.ACTIVE.value:
+                if (
+                    row["github_review_id"] == github_review_id
+                    and row["submitted_at"] == submitted_at
+                ):
+                    return _review_attempt_from_row(row)
+                raise RuntimeError("active review attempt is bound to another review")
+            if row["status"] != ReviewAttemptStatus.PREPARED.value:
+                raise RuntimeError("review attempt is terminal")
+            with self._allow_review_attempt_write():
+                updated_count = db.execute(
+                    """
+                    UPDATE review_attempts
+                    SET status = 'ACTIVE', github_review_id = ?, submitted_at = ?,
+                        activated_at = ?
+                    WHERE review_context_id = ? AND status = 'PREPARED'
+                    """,
+                    (github_review_id, submitted_at, now, review_context_id),
+                ).rowcount
+            if updated_count != 1:
+                raise RuntimeError("review attempt activation CAS failed")
+            updated = db.execute(
+                "SELECT * FROM review_attempts WHERE review_context_id = ?",
+                (review_context_id,),
+            ).fetchone()
+        return _review_attempt_from_row(updated)
+
+    def invalidate_review_attempt(
+        self, review_context_id: str, *, reason: str
+    ) -> ReviewAttempt:
+        if not reason:
+            raise ValueError("invalidation reason is required")
+        now = _timestamp()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM review_attempts WHERE review_context_id = ?",
+                (review_context_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown review context: {review_context_id}")
+            if row["status"] == ReviewAttemptStatus.INVALIDATED.value:
+                if row["invalidation_reason"] == reason:
+                    return _review_attempt_from_row(row)
+                raise RuntimeError("review attempt is already terminal")
+            with self._allow_review_attempt_write():
+                updated_count = db.execute(
+                    """
+                    UPDATE review_attempts
+                    SET status = 'INVALIDATED', invalidated_at = ?,
+                        invalidation_reason = ?
+                    WHERE review_context_id = ?
+                      AND status IN ('PREPARED', 'ACTIVE')
+                    """,
+                    (now, reason, review_context_id),
+                ).rowcount
+            if updated_count != 1:
+                raise RuntimeError("review attempt invalidation CAS failed")
+            updated = db.execute(
+                "SELECT * FROM review_attempts WHERE review_context_id = ?",
+                (review_context_id,),
+            ).fetchone()
+        return _review_attempt_from_row(updated)
+
     def list_jobs(
         self,
         states: set[ReviewState] | frozenset[ReviewState] | None = None,
@@ -756,6 +1132,12 @@ class StateStore:
                     job_id,
                 ),
             )
+            self._invalidate_if_job_left_review_context(
+                db,
+                job_id,
+                target,
+                now=now,
+            )
             updated = db.execute(
                 "SELECT * FROM review_jobs WHERE id = ?", (job_id,)
             ).fetchone()
@@ -836,8 +1218,55 @@ class StateStore:
             ).fetchone()
         return row is not None
 
-    @staticmethod
+    def _invalidate_job_attempts(
+        self,
+        db: sqlite3.Connection,
+        job_ids: tuple[int, ...],
+        *,
+        reason: str,
+        now: str,
+    ) -> None:
+        if not job_ids:
+            return
+        placeholders = ", ".join("?" for _ in job_ids)
+        with self._allow_review_attempt_write():
+            db.execute(
+                f"""
+                UPDATE review_attempts
+                SET status = 'INVALIDATED', invalidated_at = ?,
+                    invalidation_reason = ?
+                WHERE job_id IN ({placeholders})
+                  AND status IN ('PREPARED', 'ACTIVE')
+                """,
+                (now, reason, *job_ids),
+            )
+
+    def _invalidate_if_job_left_review_context(
+        self,
+        db: sqlite3.Connection,
+        job_id: int,
+        state: ReviewState,
+        *,
+        now: str,
+    ) -> None:
+        if state in {
+            ReviewState.WAITING_READY,
+            ReviewState.CHANGES_REQUIRED,
+            ReviewState.HUMAN_REVIEW,
+            ReviewState.FAILED,
+            ReviewState.MERGED,
+            ReviewState.OBSOLETE,
+            ReviewState.CLOSED,
+        }:
+            self._invalidate_job_attempts(
+                db,
+                (job_id,),
+                reason=f"JOB_{state.value}",
+                now=now,
+            )
+
     def _obsolete_other_heads(
+        self,
         db: sqlite3.Connection,
         repository: str,
         pull_number: int,
@@ -846,27 +1275,42 @@ class StateStore:
     ) -> None:
         active_values = sorted(state.value for state in ACTIVE_STATES)
         placeholders = ", ".join("?" for _ in active_values)
+        rows = db.execute(
+            f"""
+            SELECT id FROM review_jobs
+            WHERE repository = ?
+              AND pull_number = ?
+              AND head_sha != ?
+              AND state IN ({placeholders})
+            ORDER BY id
+            """,
+            (
+                repository,
+                pull_number,
+                current_head_sha,
+                *active_values,
+            ),
+        ).fetchall()
+        job_ids = tuple(row["id"] for row in rows)
+        self._invalidate_job_attempts(
+            db,
+            job_ids,
+            reason="JOB_OBSOLETE_NEW_HEAD",
+            now=now,
+        )
+        if not job_ids:
+            return
+        job_placeholders = ", ".join("?" for _ in job_ids)
         db.execute(
             f"""
             UPDATE review_jobs
             SET state = 'OBSOLETE',
                 finished_at = ?,
                 updated_at = ?
-            WHERE repository = ?
-              AND pull_number = ?
-              AND head_sha != ?
-              AND state IN ({placeholders})
+            WHERE id IN ({job_placeholders})
             """,
-            (
-                now,
-                now,
-                repository,
-                pull_number,
-                current_head_sha,
-                *active_values,
-            ),
+            (now, now, *job_ids),
         )
-
 
 def _initial_state(event: WebhookEvent) -> ReviewState:
     if event.action == "closed":
@@ -955,6 +1399,86 @@ def _ci_request_from_row(row: sqlite3.Row) -> CIRequestPlan:
         blocked_reason=row["blocked_reason"],
         created_at=row["created_at"],
     )
+
+
+def _validate_review_job_context(
+    job: sqlite3.Row,
+    content: sqlite3.Row,
+) -> None:
+    if ReviewState(job["state"]) not in {
+        ReviewState.QUEUED,
+        ReviewState.REVIEWING,
+        ReviewState.WAITING_CI,
+        ReviewState.READY_TO_MERGE,
+    }:
+        raise RuntimeError("review job is no longer active")
+    if (
+        job["repository_id"] != content["repository_id"]
+        or job["pull_number"] != content["pull_number"]
+        or job["base_sha"] != content["base_sha"]
+        or job["head_sha"] != content["head_sha"]
+    ):
+        raise RuntimeError("review context no longer matches review job")
+
+
+def _stored_review_context_from_row(row: sqlite3.Row) -> StoredReviewContext:
+    canonical_bytes = bytes(row["canonical_payload"])
+    value = ReviewContextContent.from_canonical_bytes(canonical_bytes)
+    if (
+        value.content_id != row["content_id"]
+        or row["algorithm_id"] != REVIEW_CONTEXT_ALGORITHM
+        or value.repository_id != row["repository_id"]
+        or value.pull_number != row["pull_number"]
+        or value.base_sha != row["base_sha"]
+        or value.head_sha != row["head_sha"]
+        or value.merge_base_sha != row["merge_base_sha"]
+        or value.diff_sha256 != row["diff_sha256"]
+        or value.policy_version != row["policy_version"]
+    ):
+        raise RuntimeError("stored review context identity mismatch")
+    return StoredReviewContext(
+        content_id=row["content_id"],
+        algorithm_id=row["algorithm_id"],
+        canonical_bytes=canonical_bytes,
+        value=value,
+        created_at=row["created_at"],
+    )
+
+
+def _review_attempt_from_row(row: sqlite3.Row) -> ReviewAttempt:
+    require_uuid7(row["review_attempt_id"], "review_attempt_id")
+    expected_context_id = (
+        f"dohwa-review-context-attempt/v1:{row['review_attempt_id']}"
+    )
+    if row["review_context_id"] != expected_context_id:
+        raise RuntimeError("stored review context ID mismatch")
+    return ReviewAttempt(
+        review_attempt_id=row["review_attempt_id"],
+        review_context_id=row["review_context_id"],
+        job_id=row["job_id"],
+        content_id=row["content_id"],
+        status=ReviewAttemptStatus(row["status"]),
+        github_review_id=row["github_review_id"],
+        submitted_at=row["submitted_at"],
+        prepared_at=row["prepared_at"],
+        activated_at=row["activated_at"],
+        invalidated_at=row["invalidated_at"],
+        invalidation_reason=row["invalidation_reason"],
+    )
+
+
+def _require_github_timestamp(value: str, field: str) -> str:
+    if not isinstance(value, str) or len(value) != 20:
+        raise ValueError(f"{field} must be a canonical UTC second timestamp")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a canonical UTC second timestamp") from exc
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise ValueError(f"{field} must be a canonical UTC second timestamp")
+    return value
 
 
 def _timestamp() -> str:
