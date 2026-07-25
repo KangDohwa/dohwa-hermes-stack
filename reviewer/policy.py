@@ -13,6 +13,10 @@ class Eligibility:
     eligible: bool
     state: str
     reason: str
+    reason_code: str = "other"
+    actual: int | None = None
+    limit: int | None = None
+    affected_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,13 +101,27 @@ class RepositoryPolicy:
         if head_repo and head_repo != self.full_name:
             return Eligibility(False, "HUMAN_REVIEW", "fork pull requests require human review")
         if len(files) > self.max_files:
-            return Eligibility(False, "HUMAN_REVIEW", "changed file limit exceeded")
+            return Eligibility(
+                False,
+                "HUMAN_REVIEW",
+                "changed file limit exceeded",
+                reason_code="changed_file_limit",
+                actual=len(files),
+                limit=self.max_files,
+            )
         changed_lines = sum(
             int(item.get("additions") or 0) + int(item.get("deletions") or 0)
             for item in files
         )
         if changed_lines > self.max_changed_lines:
-            return Eligibility(False, "HUMAN_REVIEW", "changed line limit exceeded")
+            return Eligibility(
+                False,
+                "HUMAN_REVIEW",
+                "changed line limit exceeded",
+                reason_code="changed_line_limit",
+                actual=changed_lines,
+                limit=self.max_changed_lines,
+            )
         candidate_paths = []
         for item in files:
             candidate_paths.append(str(item.get("filename") or ""))
@@ -111,7 +129,15 @@ class RepositoryPolicy:
                 candidate_paths.append(str(item["previous_filename"]))
         risky = self.high_risk_files(candidate_paths)
         if risky:
-            return Eligibility(False, "HUMAN_REVIEW", f"high-risk paths changed: {', '.join(risky[:5])}")
+            return Eligibility(
+                False,
+                "HUMAN_REVIEW",
+                f"high-risk paths changed: {', '.join(risky[:5])}",
+                reason_code="high_risk_paths",
+                actual=len(risky),
+                limit=0,
+                affected_paths=tuple(risky),
+            )
         unreviewable = sorted(
             str(item.get("filename") or "")
             for item in files
@@ -122,6 +148,10 @@ class RepositoryPolicy:
                 False,
                 "HUMAN_REVIEW",
                 f"diff content unavailable: {', '.join(unreviewable[:5])}",
+                reason_code="diff_unavailable",
+                actual=len(unreviewable),
+                limit=0,
+                affected_paths=tuple(unreviewable),
             )
         return Eligibility(True, "QUEUED", "eligible")
 

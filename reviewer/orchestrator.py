@@ -44,6 +44,8 @@ WEBHOOK_CONCURRENCY = 8
 WEBHOOK_ACQUIRE_TIMEOUT_SECONDS = 0.25
 WEBHOOK_SLOTS = asyncio.Semaphore(WEBHOOK_CONCURRENCY)
 CHANGES_REQUESTED_LABEL = "hermes:changes-requested"
+POLICY_REPORT_PATH_LIMIT = 5
+POLICY_REPORT_PATH_CHARS = 120
 
 
 class ReviewerRuntime:
@@ -210,7 +212,12 @@ class ReviewerRuntime:
         policy = self.policies[job.repository]
         eligibility = policy.evaluate(pull, files)
         if not eligibility.eligible:
-            await self._finish_ineligible(job, pull, eligibility)
+            await self._finish_ineligible(
+                job,
+                pull,
+                eligibility,
+                analyzer_ran=False,
+            )
             return
 
         await self._report(job, "검토 시작", "도화봇이 pull request 검토를 시작했습니다.", pull=pull)
@@ -249,7 +256,12 @@ class ReviewerRuntime:
             return
         current_eligibility = policy.evaluate(current, current_files)
         if not current_eligibility.eligible:
-            await self._finish_ineligible(job, current, current_eligibility)
+            await self._finish_ineligible(
+                job,
+                current,
+                current_eligibility,
+                analyzer_ran=True,
+            )
             return
         if hashlib.sha256(current_diff.encode("utf-8")).digest() != hashlib.sha256(diff.encode("utf-8")).digest():
             self.store.transition(
@@ -509,10 +521,22 @@ class ReviewerRuntime:
             and base_sha == job.base_sha.lower()
         )
 
-    async def _finish_ineligible(self, job: ReviewJob, pull: dict[str, Any], eligibility: Eligibility) -> None:
+    async def _finish_ineligible(
+        self,
+        job: ReviewJob,
+        pull: dict[str, Any],
+        eligibility: Eligibility,
+        *,
+        analyzer_ran: bool,
+    ) -> None:
         target = ReviewState.WAITING_READY if eligibility.state == "WAITING_READY" else ReviewState.HUMAN_REVIEW
         self.store.transition(job.id, target, expected=ReviewState.REVIEWING, review_decision="human_review", last_error=eligibility.reason)
-        await self._report(job, "자동 검토 제외", eligibility.reason, pull=pull)
+        await self._report(
+            job,
+            "자동 검토 제외",
+            _policy_exclusion_summary(eligibility, analyzer_ran=analyzer_ran),
+            pull=pull,
+        )
 
     async def _dispatch(
         self,
@@ -670,6 +694,88 @@ class ReviewerRuntime:
 def _optional_id(payload: dict[str, Any]) -> int | None:
     value = payload.get("id")
     return value if isinstance(value, int) else None
+
+
+def _policy_exclusion_summary(
+    eligibility: Eligibility,
+    *,
+    analyzer_ran: bool,
+) -> str:
+    labels = {
+        "changed_file_limit": "변경 파일 수 한도 초과",
+        "changed_line_limit": "변경 줄 수 한도 초과",
+        "high_risk_paths": "고위험 경로 변경",
+        "diff_unavailable": "검토 가능한 diff 없음",
+    }
+    metrics = {
+        "changed_file_limit": "변경 파일",
+        "changed_line_limit": "변경 줄",
+        "high_risk_paths": "고위험 경로",
+        "diff_unavailable": "diff 미제공 파일",
+    }
+    units = {
+        "changed_file_limit": "개",
+        "changed_line_limit": "줄",
+        "high_risk_paths": "개",
+        "diff_unavailable": "개",
+    }
+    actions = {
+        "changed_file_limit": (
+            "사람이 직접 검토·승인하세요. 자동 검토가 필요하면 PR을 파일 수 한도 이하로 분할하세요."
+        ),
+        "changed_line_limit": (
+            "사람이 직접 검토·승인하세요. 자동 검토가 필요하면 PR을 변경 줄 수 한도 이하로 분할하세요."
+        ),
+        "high_risk_paths": (
+            "보안·운영 영향을 사람이 직접 검토하고 승인하세요. 이 판정은 파일 분할만으로 우회하지 마세요."
+        ),
+        "diff_unavailable": (
+            "GitHub에서 표시되지 않는 파일 내용을 사람이 직접 확인하고 승인하세요."
+        ),
+    }
+
+    code = eligibility.reason_code
+    label = labels.get(code, _safe_policy_excerpt(eligibility.reason, 180))
+    lines = [f"정책 판정: {label}"]
+    if eligibility.actual is not None and eligibility.limit is not None:
+        metric = metrics.get(code, "정책 측정값")
+        unit = units.get(code, "")
+        lines.append(
+            f"실제값 / 허용 한도: {metric} {eligibility.actual:,}{unit} / "
+            f"{eligibility.limit:,}{unit}"
+        )
+    if analyzer_ran:
+        lines.append(
+            "Hermes analyzer: 이미 실행됨 · 변경된 현재 상태에는 분석 결과를 적용하지 않음"
+        )
+    else:
+        lines.append("Hermes analyzer: 호출하지 않음 · 모델 사용량 없음")
+    lines.append(
+        "필요 조치: "
+        + actions.get(
+            code,
+            "자동 처리를 중단했습니다. 사유를 확인한 뒤 사람이 직접 검토하세요.",
+        )
+    )
+
+    if eligibility.affected_paths:
+        shown = [
+            _safe_policy_excerpt(path, POLICY_REPORT_PATH_CHARS)
+            for path in eligibility.affected_paths[:POLICY_REPORT_PATH_LIMIT]
+        ]
+        omitted = len(eligibility.affected_paths) - len(shown)
+        evidence = ", ".join(shown)
+        if omitted:
+            evidence += f" 외 {omitted:,}개"
+        lines.append(f"근거 경로: {evidence}")
+    return "\n".join(lines)
+
+
+def _safe_policy_excerpt(value: str, maximum: int) -> str:
+    text = " ".join(str(value or "").split()) or "(값 없음)"
+    if len(text) <= maximum:
+        return text
+    return text[: maximum - 1].rstrip() + "…"
 
 
 @asynccontextmanager
