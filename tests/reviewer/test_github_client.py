@@ -13,6 +13,7 @@ BASE_SHA = "1" * 40
 WORKFLOW_SHA = "2" * 40
 WORKFLOW_ID = 321
 WORKFLOW_PATH = ".github/workflows/dohwa-candidate-ci.yml"
+WORKFLOW_DISPATCH_REF = "refs/heads/dohwa-workflow/v1"
 WORKFLOW_DEFINITION = b"name: pinned workflow\n"
 WORKFLOW_DEFINITION_SHA256 = "67da2b5043e83f47e4817708a1eb3d0ed3aef552e2d3eba3188f4923a7ccabf9"
 CI_REQUEST_ID = "a" * 64
@@ -115,11 +116,21 @@ class GitHubClientTests(unittest.TestCase):
                         path=WORKFLOW_PATH,
                         revision=WORKFLOW_SHA,
                         definition_sha256=WORKFLOW_DEFINITION_SHA256,
+                        dispatch_ref=WORKFLOW_DISPATCH_REF,
                     )
                 }
             },
             **kwargs,
         )
+
+    @staticmethod
+    def workflow_ref(**overrides):
+        value = {
+            "ref": WORKFLOW_DISPATCH_REF,
+            "object": {"type": "commit", "sha": WORKFLOW_SHA},
+        }
+        value.update(overrides)
+        return value
 
     @staticmethod
     def workflow_inputs(**overrides):
@@ -143,7 +154,8 @@ class GitHubClientTests(unittest.TestCase):
             "triggering_actor": {"login": "example-reviewer[bot]"},
             "repository": {"id": 99, "full_name": REPOSITORY},
             "workflow_id": WORKFLOW_ID,
-            "path": f"{WORKFLOW_PATH}@{WORKFLOW_SHA}",
+            "path": WORKFLOW_PATH,
+            "head_branch": "dohwa-workflow/v1",
             "head_sha": WORKFLOW_SHA,
             "created_at": "2026-07-25T00:01:00Z",
             "run_attempt": 1,
@@ -159,11 +171,22 @@ class GitHubClientTests(unittest.TestCase):
             {"revision": "3" * 39},
             {"definition_sha256": "C" * 64},
             {"definition_sha256": "c" * 63},
+            {"dispatch_ref": "dohwa-workflow/v1"},
+            {"dispatch_ref": "refs/tags/dohwa-workflow/v1"},
+            {"dispatch_ref": "refs/heads/dohwa-workflow/../main"},
+            {"dispatch_ref": "refs/heads/dohwa-workflow//v1"},
+            {"dispatch_ref": "refs/heads/dohwa-workflow/@{v1"},
+            {"dispatch_ref": "refs/heads/dohwa-workflow/.hidden"},
+            {"dispatch_ref": "refs/heads/dohwa-workflow/v1."},
+            {"dispatch_ref": "refs/heads/dohwa-workflow/v1/"},
+            {"dispatch_ref": "refs/heads/dohwa-workflow/v1.lock"},
+            {"dispatch_ref": "refs/heads/" + "x" * 245},
         )
         base = {
             "path": WORKFLOW_PATH,
             "revision": WORKFLOW_SHA,
             "definition_sha256": WORKFLOW_DEFINITION_SHA256,
+            "dispatch_ref": WORKFLOW_DISPATCH_REF,
         }
         for override in invalid:
             with self.subTest(override=override):
@@ -191,7 +214,9 @@ class GitHubClientTests(unittest.TestCase):
         self.assertEqual(self.transport.requests, [])
 
     def test_dispatch_workflow_uses_only_allowlisted_id_and_strict_inputs(self):
-        client = self.make_actions_client([BinaryResponse(b"", status=204)])
+        client = self.make_actions_client(
+            [FakeResponse(self.workflow_ref()), BinaryResponse(b"", status=204)]
+        )
 
         result = client.dispatch_workflow(
             REPOSITORY,
@@ -202,7 +227,11 @@ class GitHubClientTests(unittest.TestCase):
         )
 
         self.assertIsNone(result)
-        api_request = self.transport.requests[0]
+        ref_request, api_request = self.transport.requests
+        self.assertEqual(ref_request.method, "GET")
+        self.assertTrue(
+            ref_request.full_url.endswith("/git/ref/heads/dohwa-workflow/v1")
+        )
         self.assertEqual(api_request.method, "POST")
         self.assertTrue(
             api_request.full_url.endswith(
@@ -211,11 +240,13 @@ class GitHubClientTests(unittest.TestCase):
         )
         self.assertEqual(
             self.request_json(api_request),
-            {"ref": WORKFLOW_SHA, "inputs": self.workflow_inputs()},
+            {"ref": WORKFLOW_DISPATCH_REF, "inputs": self.workflow_inputs()},
         )
 
     def test_dispatch_workflow_requires_204(self):
-        client = self.make_actions_client([FakeResponse({}, status=200)])
+        client = self.make_actions_client(
+            [FakeResponse(self.workflow_ref()), FakeResponse({}, status=200)]
+        )
         with self.assertRaises(GitHubAPIError):
             client.dispatch_workflow(
                 REPOSITORY,
@@ -224,6 +255,31 @@ class GitHubClientTests(unittest.TestCase):
                 workflow_definition=WORKFLOW_DEFINITION,
                 inputs=self.workflow_inputs(),
             )
+
+    def test_dispatch_workflow_rejects_changed_ref_before_dispatch(self):
+        mismatches = (
+            {"ref": "refs/heads/main"},
+            {"object": {"type": "tag", "sha": WORKFLOW_SHA}},
+            {"object": {"type": "commit", "sha": "3" * 40}},
+            {"object": None},
+        )
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch):
+                client = self.make_actions_client(
+                    [FakeResponse(self.workflow_ref(**mismatch))]
+                )
+                with self.assertRaisesRegex(
+                    GitHubAPIError, "IMMUTABLE_WORKFLOW_REF_MISMATCH"
+                ):
+                    client.dispatch_workflow(
+                        REPOSITORY,
+                        WORKFLOW_ID,
+                        workflow_revision=WORKFLOW_SHA,
+                        workflow_definition=WORKFLOW_DEFINITION,
+                        inputs=self.workflow_inputs(),
+                    )
+                self.assertEqual(len(self.transport.requests), 1)
+                self.assertEqual(self.transport.requests[0].method, "GET")
 
     def test_dispatch_workflow_rejects_unapproved_identity_before_network(self):
         invalid_cases = (
@@ -641,7 +697,8 @@ class GitHubClientTests(unittest.TestCase):
 
         self.assertEqual(result["id"], 1)
         self.assertEqual(result["head_sha"], WORKFLOW_SHA)
-        self.assertEqual(result["path"], f"{WORKFLOW_PATH}@{WORKFLOW_SHA}")
+        self.assertEqual(result["path"], WORKFLOW_PATH)
+        self.assertEqual(result["head_branch"], "dohwa-workflow/v1")
         self.assertEqual(clock.sleeps, [1.0])
 
     def test_correlate_workflow_run_reports_not_found_and_ambiguity(self):
@@ -693,6 +750,7 @@ class GitHubClientTests(unittest.TestCase):
         mismatches = (
             {"head_sha": "f" * 40},
             {"path": ".github/workflows/other.yml"},
+            {"head_branch": "main"},
             {"actor": {"login": "someone"}},
             {"repository": {"id": 100, "full_name": REPOSITORY}},
             {"created_at": "2026-07-25T00:11:00Z"},

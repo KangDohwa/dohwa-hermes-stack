@@ -220,6 +220,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("read", job["permissions"]["contents"])
         self.assertEqual("none", job["permissions"]["id-token"])
         self.assertNotIn("uses:", text)
+        self.assertIn('echo "::add-mask::$auth_header"', text)
+        self.assertIn("http.extraheader=AUTHORIZATION: basic $auth_header", text)
+        self.assertIn("unset FETCH_TOKEN auth_header", text)
+        self.assertNotIn("AUTHORIZATION: bearer $FETCH_TOKEN", text)
         for forbidden in ("pull_request_target", "git push", "updateRefs", "actions/cache", "upload-artifact"):
             self.assertNotIn(forbidden, text)
 

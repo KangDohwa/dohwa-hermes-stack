@@ -31,6 +31,11 @@ workflow revision, repository, or attempt is not valid evidence.
 
 The workflow is manually dispatched by an authorized integration. It validates
 bounded identifiers and a canonical descriptor before doing any setup.
+Dispatch uses an allowlisted full `refs/heads/...` name whose create, update,
+delete, and recreation are denied to ordinary repository credentials. The
+allowlisted App is the sole ruleset bypass actor. The coordinator still requires
+the resulting run's head SHA and fetched workflow bytes to match the approved
+workflow revision exactly.
 
 Its token permissions are read-only and it does not request an identity token.
 It does not use third-party Actions. Candidate execution must not receive
