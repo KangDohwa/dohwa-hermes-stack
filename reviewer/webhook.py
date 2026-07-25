@@ -136,6 +136,7 @@ def parse_webhook(
         sender_id=_optional_int(sender.get("id")),
         sender_node_id=_optional_str(sender.get("node_id")),
         sender_login=_optional_str(sender.get("login")),
+        sender_type=_optional_str(sender.get("type")),
         pull_updated_at=_optional_str(pull_request.get("updated_at")),
         payload_sha256=hashlib.sha256(raw_body).hexdigest(),
     )
@@ -161,6 +162,7 @@ def parse_webhook(
                 or not _is_positive_int(event.sender_id)
                 or not event.sender_node_id
                 or not event.sender_login
+                or not event.sender_type
                 or not _is_exact_lower_sha(event.base_sha)
                 or not _is_exact_lower_sha(event.head_sha)
                 or not _is_canonical_github_datetime(event.pull_updated_at)

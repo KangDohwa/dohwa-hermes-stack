@@ -48,7 +48,12 @@ def label_body_for(action="labeled", **overrides):
             "node_id": "LA_label_654",
             "name": "hermes:merge-approved",
         },
-        "sender": {"id": 987, "node_id": "U_sender_987", "login": "approver"},
+        "sender": {
+            "id": 987,
+            "node_id": "U_sender_987",
+            "login": "approver",
+            "type": "User",
+        },
         "pull_request": {
             "number": 7,
             "updated_at": "2026-07-25T01:02:03Z",
@@ -218,6 +223,7 @@ class ParseWebhookTests(unittest.TestCase):
                 self.assertEqual(987, event.sender_id)
                 self.assertEqual("U_sender_987", event.sender_node_id)
                 self.assertEqual("approver", event.sender_login)
+                self.assertEqual("User", event.sender_type)
                 self.assertEqual("2026-07-25T01:02:03Z", event.pull_updated_at)
                 self.assertEqual(
                     hashlib.sha256(raw_body).hexdigest(), event.payload_sha256
@@ -234,6 +240,7 @@ class ParseWebhookTests(unittest.TestCase):
             lambda value: value["sender"].update(id=False),
             lambda value: value["sender"].pop("node_id"),
             lambda value: value["sender"].pop("login"),
+            lambda value: value["sender"].pop("type"),
             lambda value: value["pull_request"].pop("updated_at"),
             lambda value: value["pull_request"].update(updated_at="not-a-time"),
             lambda value: value["pull_request"]["base"].update(sha="B" * 40),
@@ -263,6 +270,29 @@ class ParseWebhookTests(unittest.TestCase):
                         raw_body,
                         SECRET,
                     )
+
+    def test_non_user_label_actor_is_preserved_as_signed_order_evidence(self):
+        payload = json.loads(label_body_for(action="unlabeled"))
+        payload["sender"].update(
+            id=123,
+            node_id="B_bot_123",
+            login="example-app[bot]",
+            type="Bot",
+        )
+        raw_body = json.dumps(payload, separators=(",", ":")).encode()
+
+        event = parse_webhook(
+            {
+                "X-GitHub-Delivery": "delivery-bot-unlabeled",
+                "X-GitHub-Event": "pull_request",
+                "X-Hub-Signature-256": signature_for(raw_body, SECRET),
+            },
+            raw_body,
+            SECRET,
+        )
+
+        self.assertEqual("Bot", event.sender_type)
+        self.assertEqual(123, event.sender_id)
 
     def test_non_label_action_remains_compatible_without_label_evidence(self):
         raw_body = body_for(action="synchronize")

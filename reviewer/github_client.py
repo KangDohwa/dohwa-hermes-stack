@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import format_datetime, parsedate_to_datetime
+from enum import StrEnum
 import hashlib
 import json
 import math
@@ -116,6 +118,85 @@ class LabelTimelineEvent:
     predecessor_event_id: str | None
 
 
+class GitHubClockDateStatus(StrEnum):
+    VALID = "VALID"
+    MISSING = "MISSING"
+    MALFORMED = "MALFORMED"
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubClockObservation:
+    response_date: str | None
+    server_date_epoch_seconds: int | None
+    request_started_monotonic: float
+    response_received_monotonic: float
+    request_rtt_seconds: float
+    date_status: GitHubClockDateStatus
+
+    def __post_init__(self) -> None:
+        values = (
+            self.request_started_monotonic,
+            self.response_received_monotonic,
+            self.request_rtt_seconds,
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in values
+        ):
+            raise ValueError("GitHub clock monotonic values must be finite numbers")
+        if self.request_rtt_seconds < 0:
+            raise ValueError("GitHub clock request RTT must not be negative")
+        if not math.isclose(
+            self.response_received_monotonic - self.request_started_monotonic,
+            self.request_rtt_seconds,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("GitHub clock request RTT does not match its observations")
+        if not isinstance(self.date_status, GitHubClockDateStatus):
+            raise ValueError("GitHub clock Date status is invalid")
+        if self.date_status is GitHubClockDateStatus.VALID:
+            if (
+                not self.response_date
+                or isinstance(self.server_date_epoch_seconds, bool)
+                or not isinstance(self.server_date_epoch_seconds, int)
+            ):
+                raise ValueError(
+                    "valid GitHub clock observation requires a server Date"
+                )
+            try:
+                parsed = parsedate_to_datetime(self.response_date)
+                if parsed.tzinfo is None:
+                    raise ValueError("GitHub clock Date has no timezone")
+                canonical = format_datetime(
+                    parsed.astimezone(timezone.utc), usegmt=True
+                )
+                epoch = parsed.timestamp()
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("valid GitHub clock Date is malformed") from exc
+            if (
+                canonical != self.response_date
+                or not math.isfinite(epoch)
+                or not epoch.is_integer()
+                or int(epoch) != self.server_date_epoch_seconds
+            ):
+                raise ValueError("GitHub clock Date and parsed epoch differ")
+        elif self.server_date_epoch_seconds is not None:
+            raise ValueError("invalid GitHub clock Date must not have a parsed epoch")
+        elif (
+            self.date_status is GitHubClockDateStatus.MISSING
+            and self.response_date is not None
+        ):
+            raise ValueError("missing GitHub clock Date must not preserve a value")
+        elif (
+            self.date_status is GitHubClockDateStatus.MALFORMED
+            and not isinstance(self.response_date, str)
+        ):
+            raise ValueError("malformed GitHub clock Date must preserve its value")
+
+
 @dataclass(frozen=True, slots=True)
 class LabelTimelineSnapshot:
     repository_node_id: str
@@ -125,6 +206,7 @@ class LabelTimelineSnapshot:
     timeline_updated_at: str
     total_count: int
     events: tuple[LabelTimelineEvent, ...]
+    clock: GitHubClockObservation
 
 
 UrlOpen = Callable[..., Any]
@@ -1014,7 +1096,7 @@ class GitHubClient:
                 "GitHub label timeline count does not match its events"
             )
 
-        watermark_data = self._graphql(
+        watermark_data, clock = self._graphql_observed(
             canonical,
             query,
             {
@@ -1047,6 +1129,22 @@ class GitHubClient:
                 "GitHub label timeline changed before verification completed"
             )
 
+        if any(
+            self._label_timeline_datetime(previous.created_at, "event createdAt")
+            == self._label_timeline_datetime(current.created_at, "event createdAt")
+            for previous, current in zip(events, events[1:])
+        ):
+            clock = self._verify_tied_label_timeline(
+                canonical=canonical,
+                owner=owner,
+                name=name,
+                pull_number=number,
+                query=query,
+                identity=identity,
+                timeline_identity=timeline_identity,
+                events=events,
+            )
+
         return LabelTimelineSnapshot(
             repository_node_id=identity[0],
             repository_database_id=identity[1],
@@ -1055,6 +1153,98 @@ class GitHubClient:
             timeline_updated_at=timeline_identity[0],
             total_count=timeline_identity[1],
             events=tuple(events),
+            clock=clock,
+        )
+
+    def _verify_tied_label_timeline(
+        self,
+        *,
+        canonical: str,
+        owner: str,
+        name: str,
+        pull_number: int,
+        query: str,
+        identity: tuple[str, int, str, int],
+        timeline_identity: tuple[str, int],
+        events: Sequence[LabelTimelineEvent],
+    ) -> GitHubClockObservation:
+        cursor: str | None = None
+        event_index = 0
+        observation: GitHubClockObservation | None = None
+        for _page in range(100):
+            data, observation = self._graphql_observed(
+                canonical,
+                query,
+                {
+                    "owner": owner,
+                    "name": name,
+                    "number": pull_number,
+                    "first": 100,
+                    "after": cursor,
+                },
+            )
+            page_identity, page_timeline, edges, page_info = (
+                self._parse_label_timeline_page(
+                    data, canonical=canonical, pull_number=pull_number
+                )
+            )
+            if page_identity != identity or page_timeline != timeline_identity:
+                self._label_timeline_error(
+                    "GitHub tied label timeline changed during full verification"
+                )
+            if cursor is not None and not edges:
+                self._label_timeline_error(
+                    "GitHub tied label timeline returned an empty intermediate page"
+                )
+            for edge in edges:
+                if event_index >= len(events) or not self._same_label_timeline_event(
+                    events[event_index], edge
+                ):
+                    self._label_timeline_error(
+                        "GitHub tied label timeline sequence changed during "
+                        "verification"
+                    )
+                event_index += 1
+
+            has_next_page = page_info["hasNextPage"]
+            end_cursor = page_info["endCursor"]
+            if edges and end_cursor != edges[-1]["cursor"]:
+                self._label_timeline_error(
+                    "GitHub tied label timeline end cursor does not match page order"
+                )
+            if not has_next_page:
+                break
+            if not isinstance(end_cursor, str) or not end_cursor:
+                self._label_timeline_error(
+                    "GitHub tied label timeline has an invalid next cursor"
+                )
+            cursor = end_cursor
+        else:
+            self._label_timeline_error(
+                "GitHub tied label timeline pagination exceeded 100 pages"
+            )
+
+        if event_index != len(events) or observation is None:
+            self._label_timeline_error(
+                "GitHub tied label timeline sequence is incomplete"
+            )
+        return observation
+
+    @staticmethod
+    def _same_label_timeline_event(
+        expected: LabelTimelineEvent, actual: Mapping[str, Any]
+    ) -> bool:
+        return (
+            expected.event_id == actual.get("event_id")
+            and expected.action == actual.get("action")
+            and expected.created_at == actual.get("created_at")
+            and expected.actor_type == actual.get("actor_type")
+            and expected.actor_node_id == actual.get("actor_node_id")
+            and expected.actor_database_id == actual.get("actor_database_id")
+            and expected.actor_login == actual.get("actor_login")
+            and expected.label_node_id == actual.get("label_node_id")
+            and expected.label_name == actual.get("label_name")
+            and expected.cursor == actual.get("cursor")
         )
 
     def has_unresolved_review_threads(
@@ -1575,7 +1765,13 @@ class GitHubClient:
     def _graphql(
         self, repository: str, query: str, variables: dict[str, Any]
     ) -> dict[str, Any]:
-        payload = self._send_json(
+        data, _ = self._graphql_observed(repository, query, variables)
+        return data
+
+    def _graphql_observed(
+        self, repository: str, query: str, variables: dict[str, Any]
+    ) -> tuple[dict[str, Any], GitHubClockObservation]:
+        payload, observation = self._send_json_observed(
             repository,
             "POST",
             self.graphql_url,
@@ -1595,7 +1791,7 @@ class GitHubClient:
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
             raise GitHubAPIError("GitHub returned invalid GraphQL data")
-        return data
+        return data, observation
 
     def _send_json(
         self,
@@ -1606,6 +1802,24 @@ class GitHubClient:
         body: dict[str, Any] | None,
         expected_statuses: tuple[int, ...],
     ) -> Any:
+        payload, _ = self._send_json_observed(
+            repository,
+            method,
+            url,
+            body=body,
+            expected_statuses=expected_statuses,
+        )
+        return payload
+
+    def _send_json_observed(
+        self,
+        repository: str,
+        method: str,
+        url: str,
+        *,
+        body: dict[str, Any] | None,
+        expected_statuses: tuple[int, ...],
+    ) -> tuple[Any, GitHubClockObservation]:
         canonical = self.auth.require_allowed_repository(repository)
         token = self.auth.installation_token_for_repository(canonical)
         encoded_body = (
@@ -1627,11 +1841,14 @@ class GitHubClient:
             headers=headers,
             method=method,
         )
+        request_started = self._monotonic()
         try:
             with self._urlopen(api_request, timeout=self.timeout) as response:
                 raw = response.read()
+                response_received = self._monotonic()
                 status = getattr(response, "status", response.getcode())
                 request_id = response.headers.get("X-GitHub-Request-Id")
+                response_date = response.headers.get("Date")
         except error.HTTPError as exc:
             self._raise_http_error(exc)
         except error.URLError as exc:
@@ -1642,12 +1859,51 @@ class GitHubClient:
                 status=status,
                 request_id=request_id,
             )
+        observation = self._github_clock_observation(
+            response_date,
+            request_started=request_started,
+            response_received=response_received,
+        )
         if not raw:
-            return {}
+            return {}, observation
         try:
-            return json.loads(raw.decode("utf-8"))
+            return json.loads(raw.decode("utf-8")), observation
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise GitHubAPIError("GitHub returned invalid JSON") from exc
+
+    @staticmethod
+    def _github_clock_observation(
+        response_date: object,
+        *,
+        request_started: float,
+        response_received: float,
+    ) -> GitHubClockObservation:
+        raw_date = response_date if isinstance(response_date, str) else None
+        status = GitHubClockDateStatus.MISSING
+        epoch: int | None = None
+        if raw_date is not None:
+            status = GitHubClockDateStatus.MALFORMED
+            try:
+                parsed = parsedate_to_datetime(raw_date)
+                if (
+                    parsed.tzinfo is not None
+                    and format_datetime(parsed.astimezone(timezone.utc), usegmt=True)
+                    == raw_date
+                ):
+                    timestamp = parsed.timestamp()
+                    if math.isfinite(timestamp) and timestamp.is_integer():
+                        epoch = int(timestamp)
+                        status = GitHubClockDateStatus.VALID
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return GitHubClockObservation(
+            response_date=raw_date,
+            server_date_epoch_seconds=epoch,
+            request_started_monotonic=request_started,
+            response_received_monotonic=response_received,
+            request_rtt_seconds=response_received - request_started,
+            date_status=status,
+        )
 
     @staticmethod
     def _raise_http_error(exc: error.HTTPError) -> None:

@@ -1,10 +1,14 @@
 import unittest
 
+from reviewer.approval import new_uuid7
 from reviewer.decision import (
     ci_satisfies_policy,
     find_existing_review,
+    find_review_attempt_review,
     format_review,
     has_blocking_human_review,
+    parse_review_attempt_marker,
+    review_attempt_marker,
 )
 from reviewer.review_schema import ReviewDecision, ReviewResult
 
@@ -37,6 +41,78 @@ class DecisionTests(unittest.TestCase):
         self.assertIsNone(find_existing_review([existing], marker, event="COMMENT", actor="example-reviewer[bot]"))
         self.assertIsNone(find_existing_review([existing], marker, event="APPROVE", actor="attacker"))
         self.assertIsNone(find_existing_review([], marker, event="APPROVE", actor="example-reviewer[bot]"))
+
+    def test_schema_two_attempt_marker_is_canonical_and_round_trips(self):
+        attempt_id = new_uuid7(timestamp_ms=1, random_bits=2)
+        marker = review_attempt_marker(
+            "Example/repository", 7, SHA, attempt_id
+        )
+        parsed = parse_review_attempt_marker(marker)
+        self.assertIsNotNone(parsed)
+        self.assertEqual("Example/repository", parsed.repository)
+        self.assertEqual(7, parsed.pull_number)
+        self.assertEqual(SHA, parsed.head_sha)
+        self.assertEqual(attempt_id, parsed.review_attempt_id)
+        self.assertIsNone(parse_review_attempt_marker(marker + " "))
+        self.assertIsNone(
+            parse_review_attempt_marker(marker.replace("pr=7", "pr=07"))
+        )
+        self.assertIsNone(
+            parse_review_attempt_marker(marker.replace(SHA, SHA.upper()))
+        )
+
+    def test_attempt_reconciliation_requires_exact_trusted_review(self):
+        attempt_id = new_uuid7(timestamp_ms=1, random_bits=2)
+        marker = review_attempt_marker(
+            "Example/repository", 7, SHA, attempt_id
+        )
+        review = {
+            "id": 9,
+            "body": "review\n" + marker,
+            "state": "COMMENTED",
+            "commit_id": SHA,
+            "submitted_at": "2026-07-25T00:00:00Z",
+            "user": {"login": "example-reviewer[bot]", "type": "Bot"},
+        }
+        self.assertEqual(
+            review,
+            find_review_attempt_review(
+                [review],
+                marker,
+                event="COMMENT",
+                actor="example-reviewer[bot]",
+                head_sha=SHA,
+            ),
+        )
+        for field, replacement in (
+            ("id", 0),
+            ("state", "APPROVED"),
+            ("commit_id", "f" * 40),
+            ("submitted_at", "2026-07-25T00:00:00.1Z"),
+            ("user", {"login": "example-reviewer[bot]", "type": "User"}),
+            ("body", "review\n" + marker + "\n" + marker),
+        ):
+            candidate = dict(review)
+            candidate[field] = replacement
+            with self.subTest(field=field):
+                self.assertIsNone(
+                    find_review_attempt_review(
+                        [candidate],
+                        marker,
+                        event="COMMENT",
+                        actor="example-reviewer[bot]",
+                        head_sha=SHA,
+                    )
+                )
+
+        with self.assertRaisesRegex(RuntimeError, "multiple GitHub reviews"):
+            find_review_attempt_review(
+                [review, dict(review, id=10)],
+                marker,
+                event="COMMENT",
+                actor="example-reviewer[bot]",
+                head_sha=SHA,
+            )
 
     def test_ci_requires_explicit_named_success(self):
         self.assertFalse(ci_satisfies_policy((), [], {"state": "success"}))
