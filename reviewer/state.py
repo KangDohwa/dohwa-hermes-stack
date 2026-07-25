@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -144,6 +144,7 @@ class StateStore:
             with self._allow_review_attempt_write():
                 self._upgrade_review_attempt_publish_schema(db)
             self._create_phase3_approval_schema(db)
+            self._upgrade_approval_outbox_delivery_schema(db)
 
     @staticmethod
     def _create_v1_schema(db: sqlite3.Connection) -> None:
@@ -328,6 +329,26 @@ class StateStore:
                 policy_version TEXT NOT NULL CHECK(length(policy_version) BETWEEN 1 AND 64),
                 created_at TEXT NOT NULL,
                 UNIQUE(algorithm_id, canonical_payload)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS review_publications (
+                marker TEXT PRIMARY KEY CHECK(length(marker) BETWEEN 1 AND 1000),
+                job_id INTEGER NOT NULL REFERENCES review_jobs(id),
+                event TEXT NOT NULL CHECK(event IN ('COMMENT', 'REQUEST_CHANGES')),
+                publish_state TEXT NOT NULL
+                    CHECK(publish_state IN ('MAYBE_SENT', 'CONFIRMED')),
+                github_review_id INTEGER,
+                publish_started_at TEXT NOT NULL,
+                publish_confirmed_at TEXT,
+                CHECK(
+                    (publish_state = 'MAYBE_SENT'
+                        AND github_review_id IS NULL
+                        AND publish_confirmed_at IS NULL)
+                    OR (publish_state = 'CONFIRMED'
+                        AND github_review_id > 0
+                        AND publish_confirmed_at IS NOT NULL)
+                )
             )
             """,
             """
@@ -752,6 +773,11 @@ class StateStore:
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 delivered_at TEXT,
+                claimed_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0
+                    CHECK(attempt_count >= 0),
+                last_error TEXT,
+                retry_at TEXT,
                 UNIQUE(delivery_id, action)
             )
             """,
@@ -877,6 +903,28 @@ class StateStore:
         for statement in statements:
             db.execute(statement)
 
+    @staticmethod
+    def _upgrade_approval_outbox_delivery_schema(
+        db: sqlite3.Connection,
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in db.execute("PRAGMA table_info(approval_outbox)").fetchall()
+        }
+        if "claimed_at" not in columns:
+            db.execute("ALTER TABLE approval_outbox ADD COLUMN claimed_at TEXT")
+        if "attempt_count" not in columns:
+            db.execute(
+                """
+                ALTER TABLE approval_outbox ADD COLUMN attempt_count INTEGER
+                    NOT NULL DEFAULT 0 CHECK(attempt_count >= 0)
+                """
+            )
+        if "last_error" not in columns:
+            db.execute("ALTER TABLE approval_outbox ADD COLUMN last_error TEXT")
+        if "retry_at" not in columns:
+            db.execute("ALTER TABLE approval_outbox ADD COLUMN retry_at TEXT")
+
     def ingest(self, event: WebhookEvent) -> IngestResult:
         now = _timestamp()
         with self._transaction() as db:
@@ -922,6 +970,24 @@ class StateStore:
             assert event.pull_number is not None
             assert event.head_sha is not None
 
+            repository_identities = {
+                row["repository_id"]
+                for row in db.execute(
+                    """
+                    SELECT DISTINCT repository_id
+                    FROM review_jobs
+                    WHERE repository = ?
+                      AND repository_id IS NOT NULL
+                    """,
+                    (event.repository,),
+                ).fetchall()
+            }
+            if repository_identities and (
+                event.repository_id is None
+                or repository_identities != {event.repository_id}
+            ):
+                return IngestResult(True, False, None)
+
             if event.action in {
                 "opened",
                 "reopened",
@@ -933,6 +999,7 @@ class StateStore:
                     event.repository,
                     event.pull_number,
                     event.head_sha,
+                    event.repository_id,
                     now,
                 )
 
@@ -976,7 +1043,63 @@ class StateStore:
             else:
                 job_id = existing["id"]
                 current = ReviewState(existing["state"])
-                if current != target and _event_may_transition(
+                if (
+                    existing["repository_id"] is not None
+                    and event.repository_id is not None
+                    and existing["repository_id"] != event.repository_id
+                ):
+                    return IngestResult(True, False, None)
+                base_changed = (
+                    event.base_sha is not None
+                    and event.base_sha != existing["base_sha"]
+                    and (
+                        current not in {ReviewState.CLOSED, ReviewState.MERGED}
+                        or event.action in {"reopened", "bootstrap_reconcile"}
+                    )
+                )
+                if base_changed:
+                    self._invalidate_job_attempts(
+                        db,
+                        (job_id,),
+                        reason="BASE_CONTEXT_CHANGED",
+                        now=now,
+                    )
+                    replacement = (
+                        target
+                        if target is not ReviewState.DISCOVERED
+                        else ReviewState.QUEUED
+                    )
+                    queued_at = now if replacement is ReviewState.QUEUED else None
+                    finished_at = (
+                        now
+                        if replacement in {ReviewState.CLOSED, ReviewState.MERGED}
+                        else None
+                    )
+                    db.execute(
+                        """
+                        UPDATE review_jobs
+                        SET state = ?, base_sha = ?,
+                            repository_id = COALESCE(repository_id, ?),
+                            queued_at = ?, started_at = NULL, finished_at = ?,
+                            review_decision = NULL, findings_hash = NULL,
+                            github_review_id = NULL, github_comment_id = NULL,
+                            discord_message_id = NULL, discord_thread_id = NULL,
+                            merge_sha = NULL, last_error = NULL, retry_at = NULL,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            replacement.value,
+                            event.base_sha,
+                            event.repository_id,
+                            queued_at,
+                            finished_at,
+                            now,
+                            job_id,
+                        ),
+                    )
+                    target = replacement
+                elif current != target and _event_may_transition(
                     event.action, current, target
                 ):
                     validate_transition(current, target)
@@ -985,11 +1108,11 @@ class StateStore:
                         UPDATE review_jobs
                         SET state = ?,
                             base_sha = COALESCE(?, base_sha),
-                            repository_id = COALESCE(?, repository_id),
+                            repository_id = COALESCE(repository_id, ?),
                             queued_at = CASE WHEN ? = 'QUEUED' THEN ? ELSE queued_at END,
                             finished_at = CASE
                                 WHEN ? IN ('CLOSED', 'MERGED') THEN ?
-                                WHEN ? = 'QUEUED' THEN NULL
+                                WHEN ? IN ('QUEUED', 'WAITING_READY') THEN NULL
                                 ELSE finished_at
                             END,
                             updated_at = ?
@@ -1059,6 +1182,39 @@ class StateStore:
                 "SELECT * FROM review_jobs WHERE id = ?", (job_id,)
             ).fetchone()
         return _job_from_row(row) if row else None
+
+    def bind_job_repository_id(
+        self,
+        job_id: int,
+        repository_id: int,
+    ) -> ReviewJob:
+        if (
+            isinstance(repository_id, bool)
+            or not isinstance(repository_id, int)
+            or repository_id <= 0
+        ):
+            raise ValueError("repository_id must be a positive integer")
+        now = _timestamp()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM review_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown review job: {job_id}")
+            if row["repository_id"] not in {None, repository_id}:
+                raise RuntimeError("review job repository identity changed")
+            if row["repository_id"] is None:
+                db.execute(
+                    """
+                    UPDATE review_jobs SET repository_id = ?, updated_at = ?
+                    WHERE id = ? AND repository_id IS NULL
+                    """,
+                    (repository_id, now, job_id),
+                )
+            persisted = db.execute(
+                "SELECT * FROM review_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return _job_from_row(persisted)
 
     def store_merge_descriptor(
         self,
@@ -1317,6 +1473,142 @@ class StateStore:
             ).fetchone()
         return _stored_review_context_from_row(row) if row else None
 
+    def begin_review_publication(
+        self,
+        *,
+        job_id: int,
+        marker: str,
+        event: str,
+    ) -> bool:
+        if not marker or len(marker) > 1_000:
+            raise ValueError("review publication marker is invalid")
+        if event not in {"COMMENT", "REQUEST_CHANGES"}:
+            raise ValueError("review publication event is invalid")
+        now = _timestamp()
+        with self._transaction() as db:
+            job = db.execute(
+                """
+                SELECT id, repository_id, pull_number
+                FROM review_jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise KeyError(f"unknown review job: {job_id}")
+            if job["repository_id"] is None:
+                raise RuntimeError("review job has no repository identity")
+            unresolved = db.execute(
+                """
+                SELECT p.marker
+                FROM review_publications p
+                JOIN review_jobs j ON j.id = p.job_id
+                WHERE j.repository_id = ? AND j.pull_number = ?
+                  AND p.publish_state = 'MAYBE_SENT'
+                ORDER BY p.publish_started_at, p.marker
+                LIMIT 1
+                """,
+                (job["repository_id"], job["pull_number"]),
+            ).fetchone()
+            if unresolved is not None and unresolved["marker"] != marker:
+                return False
+            unresolved_pass = db.execute(
+                """
+                SELECT 1 FROM review_attempts
+                WHERE repository_id = ? AND pull_number = ?
+                  AND publish_state = 'MAYBE_SENT'
+                LIMIT 1
+                """,
+                (job["repository_id"], job["pull_number"]),
+            ).fetchone()
+            if unresolved_pass is not None:
+                return False
+            inserted = db.execute(
+                """
+                INSERT OR IGNORE INTO review_publications(
+                    marker, job_id, event, publish_state, publish_started_at
+                ) VALUES (?, ?, ?, 'MAYBE_SENT', ?)
+                """,
+                (marker, job_id, event, now),
+            )
+            row = db.execute(
+                "SELECT * FROM review_publications WHERE marker = ?",
+                (marker,),
+            ).fetchone()
+            if row["job_id"] != job_id or row["event"] != event:
+                raise RuntimeError("review publication marker identity collision")
+            return inserted.rowcount == 1
+
+    def has_unresolved_review_publication(
+        self,
+        *,
+        repository_id: int,
+        pull_number: int,
+    ) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1
+                FROM review_publications p
+                JOIN review_jobs j ON j.id = p.job_id
+                WHERE j.repository_id = ? AND j.pull_number = ?
+                  AND p.publish_state = 'MAYBE_SENT'
+                LIMIT 1
+                """,
+                (repository_id, pull_number),
+            ).fetchone()
+        return row is not None
+
+    def confirm_review_publication(
+        self,
+        *,
+        job_id: int,
+        marker: str,
+        event: str,
+        github_review_id: int,
+    ) -> None:
+        if (
+            isinstance(github_review_id, bool)
+            or not isinstance(github_review_id, int)
+            or github_review_id <= 0
+        ):
+            raise ValueError("github_review_id must be a positive integer")
+        if event not in {"COMMENT", "REQUEST_CHANGES"}:
+            raise ValueError("review publication event is invalid")
+        now = _timestamp()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM review_publications WHERE marker = ?",
+                (marker,),
+            ).fetchone()
+            if row is None:
+                db.execute(
+                    """
+                    INSERT INTO review_publications(
+                        marker, job_id, event, publish_state, github_review_id,
+                        publish_started_at, publish_confirmed_at
+                    ) VALUES (?, ?, ?, 'CONFIRMED', ?, ?, ?)
+                    """,
+                    (marker, job_id, event, github_review_id, now, now),
+                )
+                return
+            if row["job_id"] != job_id or row["event"] != event:
+                raise RuntimeError("review publication marker identity collision")
+            if row["publish_state"] == "CONFIRMED":
+                if row["github_review_id"] != github_review_id:
+                    raise RuntimeError("review publication is bound to another review")
+                return
+            updated = db.execute(
+                """
+                UPDATE review_publications
+                SET publish_state = 'CONFIRMED', github_review_id = ?,
+                    publish_confirmed_at = ?
+                WHERE marker = ? AND publish_state = 'MAYBE_SENT'
+                """,
+                (github_review_id, now, marker),
+            ).rowcount
+            if updated != 1:
+                raise RuntimeError("review publication confirmation CAS failed")
+
     def prepare_review_attempt(
         self,
         *,
@@ -1343,6 +1635,21 @@ class StateStore:
             if content is None:
                 raise KeyError(f"unknown review context content: {content_id}")
             _validate_review_job_context(job, content)
+            unresolved_generic = db.execute(
+                """
+                SELECT 1
+                FROM review_publications p
+                JOIN review_jobs j ON j.id = p.job_id
+                WHERE j.repository_id = ? AND j.pull_number = ?
+                  AND p.publish_state = 'MAYBE_SENT'
+                LIMIT 1
+                """,
+                (content["repository_id"], content["pull_number"]),
+            ).fetchone()
+            if unresolved_generic is not None:
+                raise RuntimeError(
+                    "pull request has an unresolved generic MAYBE_SENT review"
+                )
             existing = db.execute(
                 """
                 SELECT * FROM review_attempts
@@ -2203,7 +2510,10 @@ class StateStore:
             outbox_payload = json.dumps(
                 {
                     "approval_id": approval_id,
+                    "generation": generation,
+                    "label_event_id": candidate["event_id"],
                     "reason": "ATOMIC_SERVER_GATES_UNAVAILABLE",
+                    "repository_id": snapshot_repository_id,
                     "review_context_id": attempt["review_context_id"],
                 },
                 separators=(",", ":"),
@@ -2245,6 +2555,134 @@ class StateStore:
             return self._connection.execute(
                 "SELECT * FROM approval_outbox ORDER BY id"
             ).fetchall()
+
+    def claim_next_approval_outbox(self) -> sqlite3.Row | None:
+        now_datetime = datetime.now(timezone.utc)
+        now = now_datetime.isoformat(timespec="seconds")
+        lease_before = (now_datetime - timedelta(minutes=5)).isoformat(
+            timespec="seconds"
+        )
+        with self._approval_transaction() as db:
+            row = db.execute(
+                """
+                SELECT current.* FROM approval_outbox AS current
+                WHERE current.delivered_at IS NULL
+                  AND (current.retry_at IS NULL OR current.retry_at <= ?)
+                  AND (current.claimed_at IS NULL OR current.claimed_at <= ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM approval_outbox AS prior
+                      WHERE prior.id < current.id
+                        AND prior.delivered_at IS NULL
+                        AND (
+                            prior.delivery_id = current.delivery_id
+                            OR (
+                                current.action = 'REMOVE_LABEL'
+                                AND prior.action = 'REMOVE_LABEL'
+                                AND prior.repository = current.repository
+                                AND prior.pull_number = current.pull_number
+                                AND prior.label_name = current.label_name
+                            )
+                        )
+                  )
+                ORDER BY current.id LIMIT 1
+                """,
+                (now, lease_before),
+            ).fetchone()
+            if row is None:
+                return None
+            updated = db.execute(
+                """
+                UPDATE approval_outbox
+                SET claimed_at = ?, attempt_count = attempt_count + 1
+                WHERE id = ? AND delivered_at IS NULL
+                  AND (claimed_at IS NULL OR claimed_at <= ?)
+                """,
+                (now, row["id"], lease_before),
+            ).rowcount
+            if updated != 1:
+                return None
+            claimed = db.execute(
+                "SELECT * FROM approval_outbox WHERE id = ?", (row["id"],)
+            ).fetchone()
+        return claimed
+
+    def complete_approval_outbox(
+        self,
+        outbox_id: int,
+        *,
+        claimed_at: str,
+        attempt_count: int,
+    ) -> None:
+        now = _timestamp()
+        with self._approval_transaction() as db:
+            row = db.execute(
+                "SELECT * FROM approval_outbox WHERE id = ?", (outbox_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown approval outbox row: {outbox_id}")
+            if row["delivered_at"] is not None:
+                return
+            if (
+                row["claimed_at"] != claimed_at
+                or row["attempt_count"] != attempt_count
+            ):
+                raise RuntimeError("approval outbox claim ownership changed")
+            updated = db.execute(
+                """
+                UPDATE approval_outbox
+                SET delivered_at = ?, claimed_at = NULL,
+                    last_error = NULL, retry_at = NULL
+                WHERE id = ? AND delivered_at IS NULL
+                  AND claimed_at = ? AND attempt_count = ?
+                """,
+                (now, outbox_id, claimed_at, attempt_count),
+            ).rowcount
+            if updated != 1:
+                raise RuntimeError("approval outbox completion CAS failed")
+
+    def retry_approval_outbox(
+        self,
+        outbox_id: int,
+        error: str,
+        *,
+        claimed_at: str,
+        attempt_count: int,
+    ) -> None:
+        message = str(error or "approval outbox delivery failed")[:2_000]
+        with self._approval_transaction() as db:
+            row = db.execute(
+                "SELECT * FROM approval_outbox WHERE id = ?", (outbox_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown approval outbox row: {outbox_id}")
+            if row["delivered_at"] is not None:
+                return
+            if (
+                row["claimed_at"] != claimed_at
+                or row["attempt_count"] != attempt_count
+            ):
+                raise RuntimeError("approval outbox claim ownership changed")
+            delay = min(2 ** min(int(row["attempt_count"]), 8), 300)
+            retry_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=delay)
+            ).isoformat(timespec="seconds")
+            updated = db.execute(
+                """
+                UPDATE approval_outbox
+                SET claimed_at = NULL, last_error = ?, retry_at = ?
+                WHERE id = ? AND delivered_at IS NULL
+                  AND claimed_at = ? AND attempt_count = ?
+                """,
+                (
+                    message,
+                    retry_at,
+                    outbox_id,
+                    claimed_at,
+                    attempt_count,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise RuntimeError("approval outbox retry CAS failed")
 
     def get_approval_record(self, approval_id: str) -> sqlite3.Row | None:
         with self._lock:
@@ -2456,6 +2894,13 @@ class StateStore:
     def recover_after_restart(self) -> RecoveryReport:
         now = _timestamp()
         with self._transaction() as db:
+            with self._allow_approval_write():
+                db.execute(
+                    """
+                    UPDATE approval_outbox SET claimed_at = NULL
+                    WHERE delivered_at IS NULL AND claimed_at IS NOT NULL
+                    """
+                )
             interrupted = db.execute(
                 "SELECT id FROM review_jobs WHERE state = 'REVIEWING' ORDER BY id"
             ).fetchall()
@@ -2602,6 +3047,7 @@ class StateStore:
         repository: str,
         pull_number: int,
         current_head_sha: str,
+        repository_id: int | None,
         now: str,
     ) -> None:
         active_values = sorted(state.value for state in ACTIVE_STATES)
@@ -2612,6 +3058,7 @@ class StateStore:
             WHERE repository = ?
               AND pull_number = ?
               AND head_sha != ?
+              AND (repository_id = ? OR repository_id IS NULL)
               AND state IN ({placeholders})
             ORDER BY id
             """,
@@ -2619,6 +3066,7 @@ class StateStore:
                 repository,
                 pull_number,
                 current_head_sha,
+                repository_id,
                 *active_values,
             ),
         ).fetchall()
@@ -2653,6 +3101,7 @@ def _initial_state(event: WebhookEvent) -> ReviewState:
         "reopened",
         "ready_for_review",
         "synchronize",
+        "bootstrap_reconcile",
     }:
         return ReviewState.QUEUED
     return ReviewState.DISCOVERED
@@ -2667,6 +3116,11 @@ def _event_may_transition(
         return current is ReviewState.WAITING_READY and target is ReviewState.QUEUED
     if action == "reopened":
         return current is ReviewState.CLOSED and target is ReviewState.QUEUED
+    if action == "bootstrap_reconcile":
+        return current is ReviewState.CLOSED and target in {
+            ReviewState.QUEUED,
+            ReviewState.WAITING_READY,
+        }
     if action == "converted_to_draft":
         return current in ACTIVE_STATES and current is not ReviewState.WAITING_READY
     if action == "closed":

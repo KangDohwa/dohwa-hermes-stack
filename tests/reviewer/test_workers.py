@@ -88,7 +88,7 @@ class ExecutorTests(unittest.TestCase):
             attachments.mkdir()
             policy = root / "policy.yml"
             policy.write_text(
-                "repositories:\n  example/test-repo:\n    tests:\n      - [python3, -c, 'print(123)']\n",
+                "version: 1\nrepositories:\n  example/test-repo:\n    tests:\n      - [python3, -c, 'print(123)']\n",
                 encoding="utf-8",
             )
             payload = self.request(attachments, [["python3", "-c", "print(123)"]])
@@ -103,7 +103,7 @@ class ExecutorTests(unittest.TestCase):
 
             if hasattr(os, "getuid") and os.getuid() == 0:
                 policy.write_text(
-                    "repositories:\n  example/test-repo:\n    tests:\n      - [python3, -c, 'import os; print(os.getuid())']\n",
+                    "version: 1\nrepositories:\n  example/test-repo:\n    tests:\n      - [python3, -c, 'import os; print(os.getuid())']\n",
                     encoding="utf-8",
                 )
                 dropped_payload = self.request(
@@ -118,7 +118,7 @@ class ExecutorTests(unittest.TestCase):
                 self.assertIn("65534", dropped["tests"][0]["detail"])
 
             policy.write_text(
-                "repositories:\n  example/test-repo:\n    tests:\n      - [python3, -c, 'print(123)']\n",
+                "version: 1\nrepositories:\n  example/test-repo:\n    tests:\n      - [python3, -c, 'print(123)']\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "exactly match"):
@@ -135,7 +135,7 @@ class ExecutorTests(unittest.TestCase):
             attachments.mkdir()
             policy = root / "policy.yml"
             policy.write_text(
-                "repositories:\n  example/test-repo:\n    tests:\n      - [python3, -c, 'print(123)']\n",
+                "version: 1\nrepositories:\n  example/test-repo:\n    tests:\n      - [python3, -c, 'print(123)']\n",
                 encoding="utf-8",
             )
             payload = self.request(attachments, [["python3", "-c", "print(123)"]])
@@ -159,6 +159,7 @@ class ExecutorTests(unittest.TestCase):
             ]
             policy = root / "policy.yml"
             policy.write_text(
+                "version: 1\n"
                 "repositories:\n"
                 "  example/test-repo:\n"
                 "    writable_test_paths: [data]\n"

@@ -36,7 +36,9 @@ services:
       GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/github-webhook-secret
       DISCORD_WEBHOOK_URL: "${DISCORD_WEBHOOK_URL:?set DISCORD_WEBHOOK_URL in the Compose environment}"
       REVIEWER_ENABLED: "true"
-      REVIEWER_MODE: comment
+      REVIEWER_MODE: "${REVIEWER_MODE:-comment}"
+      REVIEWER_APPROVER_IDS: "${REVIEWER_APPROVER_IDS:-}"
+      REVIEWER_APPROVAL_LABEL: "${REVIEWER_APPROVAL_LABEL:-hermes:merge-approved}"
       REVIEWER_REPOSITORIES: "${REVIEWER_REPOSITORIES:-KangDohwa/dohwa-hermes-stack}"
       REVIEWER_SPOOL: /var/lib/hermes-reviewer/spool
       REVIEWER_STATE_DB: /var/lib/hermes-reviewer/state.sqlite3

@@ -27,6 +27,7 @@ class PolicyTests(unittest.TestCase):
         result = self.policy.evaluate(pull(), [{"filename": "tests/test_ok.py", "additions": 3, "patch": "+ok"}])
         self.assertTrue(result.eligible)
         self.assertEqual(result.state, "QUEUED")
+        self.assertEqual("1", self.policy.policy_version)
 
     def test_skip_labels_are_case_insensitive(self):
         result = self.policy.evaluate(

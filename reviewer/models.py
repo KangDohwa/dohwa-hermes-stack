@@ -112,7 +112,9 @@ ALLOWED_TRANSITIONS: Mapping[ReviewState, frozenset[ReviewState]] = {
     ),
     ReviewState.MERGED: frozenset(),
     ReviewState.OBSOLETE: frozenset({ReviewState.CLOSED, ReviewState.MERGED}),
-    ReviewState.CLOSED: frozenset({ReviewState.QUEUED}),
+    ReviewState.CLOSED: frozenset(
+        {ReviewState.WAITING_READY, ReviewState.QUEUED}
+    ),
 }
 
 

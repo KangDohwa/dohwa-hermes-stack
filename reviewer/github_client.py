@@ -292,6 +292,33 @@ class GitHubClient:
             f"{self._repo_path(repository)}/pulls/{self._number(pull_number)}",
         )
 
+    def installation_id_for_repository(self, repository: str) -> int:
+        return self.auth.installation_id_for_repository(repository)
+
+    def get_merge_base_sha(
+        self,
+        repository: str,
+        *,
+        base_sha: str,
+        head_sha: str,
+    ) -> str:
+        base = self._sha(base_sha).lower()
+        head = self._sha(head_sha).lower()
+        payload = self._request(
+            repository,
+            "GET",
+            f"{self._repo_path(repository)}/compare/{base}...{head}",
+        )
+        merge_base = (
+            payload.get("merge_base_commit")
+            if isinstance(payload, dict)
+            else None
+        )
+        value = merge_base.get("sha") if isinstance(merge_base, dict) else None
+        if not isinstance(value, str) or _PINNED_SHA_PATTERN.fullmatch(value) is None:
+            raise GitHubAPIError("GitHub compare response has no canonical merge base")
+        return value
+
     def list_open_pull_requests(self, repository: str) -> list[dict[str, Any]]:
         return self._paginate(
             repository,
@@ -890,6 +917,36 @@ class GitHubClient:
             body=payload,
             expected_statuses=(200,),
         )
+
+    def dismiss_review(
+        self,
+        repository: str,
+        pull_number: int,
+        review_id: int,
+        *,
+        message: str,
+    ) -> dict[str, Any]:
+        if isinstance(review_id, bool) or not isinstance(review_id, int) or review_id <= 0:
+            raise ValueError("review_id must be a positive integer")
+        if not isinstance(message, str) or not message.strip() or len(message) > 1_000:
+            raise ValueError("dismissal message must contain at most 1000 characters")
+        payload = self._request(
+            repository,
+            "PUT",
+            (
+                f"{self._repo_path(repository)}/pulls/"
+                f"{self._number(pull_number)}/reviews/{review_id}/dismissals"
+            ),
+            body={"message": message},
+            expected_statuses=(200,),
+        )
+        if (
+            not isinstance(payload, dict)
+            or payload.get("id") != review_id
+            or str(payload.get("state") or "").upper() != "DISMISSED"
+        ):
+            raise GitHubAPIError("GitHub did not confirm review dismissal")
+        return payload
 
     def create_comment(
         self, repository: str, pull_number: int, *, body: str

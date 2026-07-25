@@ -375,6 +375,101 @@ class ApprovalTransactionTests(unittest.TestCase):
         )
         self.assertEqual(2, len(self.store.list_approval_outbox()))
 
+    def test_outbox_retries_in_order_and_completes_idempotently(self):
+        self.process()
+
+        remove = self.store.claim_next_approval_outbox()
+        assert remove is not None
+        self.assertEqual("REMOVE_LABEL", remove["action"])
+        self.assertEqual(1, remove["attempt_count"])
+        self.assertIsNone(self.store.claim_next_approval_outbox())
+
+        self.store.retry_approval_outbox(
+            remove["id"],
+            "temporary failure",
+            claimed_at=remove["claimed_at"],
+            attempt_count=remove["attempt_count"],
+        )
+        retried = self.store.list_approval_outbox()[0]
+        self.assertIsNone(retried["claimed_at"])
+        self.assertEqual("temporary failure", retried["last_error"])
+        self.assertIsNotNone(retried["retry_at"])
+        self.assertIsNone(self.store.claim_next_approval_outbox())
+
+        with self.store._approval_transaction() as db:
+            db.execute(
+                "UPDATE approval_outbox SET retry_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", remove["id"]),
+            )
+        remove_again = self.store.claim_next_approval_outbox()
+        assert remove_again is not None
+        self.assertEqual(remove["id"], remove_again["id"])
+        self.assertEqual(2, remove_again["attempt_count"])
+        self.store.complete_approval_outbox(
+            remove_again["id"],
+            claimed_at=remove_again["claimed_at"],
+            attempt_count=remove_again["attempt_count"],
+        )
+        self.store.complete_approval_outbox(
+            remove_again["id"],
+            claimed_at=remove_again["claimed_at"],
+            attempt_count=remove_again["attempt_count"],
+        )
+
+        report = self.store.claim_next_approval_outbox()
+        assert report is not None
+        self.assertEqual("DISCORD_REPORT", report["action"])
+        self.store.complete_approval_outbox(
+            report["id"],
+            claimed_at=report["claimed_at"],
+            attempt_count=report["attempt_count"],
+        )
+        self.assertIsNone(self.store.claim_next_approval_outbox())
+        self.assertTrue(
+            all(row["delivered_at"] for row in self.store.list_approval_outbox())
+        )
+
+    def test_restart_releases_unfinished_outbox_claim(self):
+        self.process()
+        claimed = self.store.claim_next_approval_outbox()
+        assert claimed is not None
+
+        self.store.recover_after_restart()
+
+        recovered = self.store.claim_next_approval_outbox()
+        assert recovered is not None
+        self.assertEqual(claimed["id"], recovered["id"])
+        self.assertEqual(2, recovered["attempt_count"])
+
+    def test_stale_worker_cannot_complete_or_retry_newer_claim(self):
+        self.process()
+        stale = self.store.claim_next_approval_outbox()
+        assert stale is not None
+        with self.store._approval_transaction() as db:
+            db.execute(
+                "UPDATE approval_outbox SET claimed_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", stale["id"]),
+            )
+        current = self.store.claim_next_approval_outbox()
+        assert current is not None
+
+        with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+            self.store.complete_approval_outbox(
+                stale["id"],
+                claimed_at=stale["claimed_at"],
+                attempt_count=stale["attempt_count"],
+            )
+        with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+            self.store.retry_approval_outbox(
+                stale["id"],
+                "stale failure",
+                claimed_at=stale["claimed_at"],
+                attempt_count=stale["attempt_count"],
+            )
+        persisted = self.store.list_approval_outbox()[0]
+        self.assertEqual(current["claimed_at"], persisted["claimed_at"])
+        self.assertEqual(current["attempt_count"], persisted["attempt_count"])
+
     def test_ttl_samples_inside_transaction_and_rejects_margin_equality(self):
         sampled_in_transaction = []
 

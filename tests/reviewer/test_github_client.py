@@ -30,6 +30,7 @@ FINISHED_AT = datetime(2026, 7, 25, 0, 10, tzinfo=timezone.utc)
 class FakeAuth:
     def __init__(self):
         self.token_repositories = []
+        self.installation_repositories = []
 
     def require_allowed_repository(self, repository):
         if repository.casefold() != REPOSITORY.casefold():
@@ -39,6 +40,10 @@ class FakeAuth:
     def installation_token_for_repository(self, repository):
         self.token_repositories.append(repository)
         return "installation-token"
+
+    def installation_id_for_repository(self, repository):
+        self.installation_repositories.append(repository)
+        return 99
 
 
 class FakeResponse:
@@ -132,6 +137,49 @@ class GitHubClientTests(unittest.TestCase):
             },
             **kwargs,
         )
+
+    def test_repository_installation_id_delegates_to_auth(self):
+        client = self.make_client([])
+
+        self.assertEqual(99, client.installation_id_for_repository(REPOSITORY))
+        self.assertEqual([REPOSITORY], self.auth.installation_repositories)
+
+    def test_merge_base_uses_exact_compare_and_requires_pinned_sha(self):
+        merge_base_sha = "3" * 40
+        client = self.make_client(
+            [FakeResponse({"merge_base_commit": {"sha": merge_base_sha}})]
+        )
+
+        result = client.get_merge_base_sha(
+            REPOSITORY,
+            base_sha=BASE_SHA,
+            head_sha=HEAD_SHA,
+        )
+
+        self.assertEqual(merge_base_sha, result)
+        api_request = self.transport.requests[0]
+        self.assertEqual("GET", api_request.method)
+        self.assertTrue(
+            api_request.full_url.endswith(
+                f"/compare/{BASE_SHA}...{HEAD_SHA}"
+            )
+        )
+
+    def test_merge_base_rejects_missing_or_noncanonical_sha(self):
+        for payload in (
+            {},
+            {"merge_base_commit": {}},
+            {"merge_base_commit": {"sha": "A" * 40}},
+            {"merge_base_commit": {"sha": "3" * 39}},
+        ):
+            with self.subTest(payload=payload):
+                client = self.make_client([FakeResponse(payload)])
+                with self.assertRaisesRegex(GitHubAPIError, "merge base"):
+                    client.get_merge_base_sha(
+                        REPOSITORY,
+                        base_sha=BASE_SHA,
+                        head_sha=HEAD_SHA,
+                    )
 
     @staticmethod
     def workflow_ref(**overrides):
@@ -1032,6 +1080,33 @@ class GitHubClientTests(unittest.TestCase):
             self.request_json(self.transport.requests[2]),
             {"labels": ["hermes:reviewed"]},
         )
+
+    def test_dismiss_review_requires_confirmed_terminal_response(self):
+        client = self.make_client(
+            [FakeResponse({"id": 17, "state": "DISMISSED"})]
+        )
+
+        result = client.dismiss_review(
+            REPOSITORY,
+            7,
+            17,
+            message="Exact review context changed",
+        )
+
+        self.assertEqual("DISMISSED", result["state"])
+        request_value = self.transport.requests[0]
+        self.assertEqual("PUT", request_value.method)
+        self.assertTrue(request_value.full_url.endswith(
+            "/pulls/7/reviews/17/dismissals"
+        ))
+        self.assertEqual(
+            {"message": "Exact review context changed"},
+            self.request_json(request_value),
+        )
+
+        client = self.make_client([FakeResponse({"id": 17, "state": "CHANGES_REQUESTED"})])
+        with self.assertRaisesRegex(GitHubAPIError, "confirm"):
+            client.dismiss_review(REPOSITORY, 7, 17, message="changed")
 
     def test_download_tarball_only_follows_trusted_codeload_without_auth(self):
         tarball = b"tarball-bytes"

@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import sys
 from types import ModuleType
@@ -26,10 +27,11 @@ except ModuleNotFoundError:
     fastapi_stub.Response = object
     sys.modules["fastapi"] = fastapi_stub
 
-from reviewer.models import ReviewJob, ReviewState
+from reviewer.models import ReviewJob, ReviewState, WebhookEvent
 from reviewer.discord_reporter import COMPACT_SUMMARY_UNITS, _discord_units
 from reviewer.orchestrator import ReviewerRuntime, _policy_exclusion_summary
 from reviewer.policy import Eligibility, RepositoryPolicy
+from reviewer.review_publisher import ReviewPublishUnknown
 
 
 REPOSITORY = "example/example-repo"
@@ -38,6 +40,85 @@ BASE_SHA = "2" * 40
 
 
 class CommentModeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bootstrap_delivery_identity_includes_base_context(self):
+        runtime, _ = self._runtime("pass")
+        first = self._fresh_pull()
+        rebased = self._fresh_pull()
+        first["number"] = 10
+        rebased["number"] = 10
+        rebased["base"]["sha"] = "3" * 40
+        runtime.settings.repositories = (REPOSITORY,)
+        runtime._stop = asyncio.Event()
+        runtime.github.list_open_pull_requests.side_effect = [[first], [rebased]]
+
+        await runtime._bootstrap_open_pulls()
+        await runtime._bootstrap_open_pulls()
+
+        events = [entry.args[0] for entry in runtime.store.ingest.call_args_list]
+        self.assertEqual(2, len(events))
+        self.assertNotEqual(events[0].delivery_id, events[1].delivery_id)
+        self.assertIn(BASE_SHA, events[0].delivery_id)
+        self.assertIn("3" * 40, events[1].delivery_id)
+        self.assertEqual([1, 1], [item.repository_id for item in events])
+
+    async def test_bootstrap_reconciles_same_snapshot_on_each_run(self):
+        runtime, _ = self._runtime("pass")
+        pull = self._fresh_pull()
+        pull["number"] = 10
+        runtime.settings.repositories = (REPOSITORY,)
+        runtime._stop = asyncio.Event()
+        runtime.github.list_open_pull_requests.return_value = [pull]
+
+        await runtime._bootstrap_open_pulls()
+        await runtime._bootstrap_open_pulls()
+
+        events = [entry.args[0] for entry in runtime.store.ingest.call_args_list]
+        self.assertEqual(2, len(events))
+        self.assertNotEqual(events[0].delivery_id, events[1].delivery_id)
+        self.assertEqual(
+            ["bootstrap_reconcile", "bootstrap_reconcile"],
+            [item.action for item in events],
+        )
+
+    async def test_approval_label_is_verified_before_general_ingest(self):
+        runtime, _ = self._runtime("pass", mode="draft")
+        event = self._approval_label_event()
+        order = []
+        runtime.approval_runtime.process_label_event.side_effect = (
+            lambda *_args, **_kwargs: order.append("approval")
+        )
+        runtime.store.ingest.side_effect = lambda *_args: order.append("ingest")
+
+        await runtime.ingest_webhook(event)
+
+        self.assertEqual(["approval", "ingest"], order)
+        runtime.approval_runtime.process_label_event.assert_called_once_with(
+            event,
+            policy=runtime.policies[REPOSITORY],
+        )
+        runtime.store.ingest.assert_called_once_with(event)
+
+    async def test_approval_adapter_failure_leaves_delivery_for_github_retry(self):
+        runtime, _ = self._runtime("pass", mode="draft")
+        event = self._approval_label_event()
+        runtime.approval_runtime.process_label_event.side_effect = RuntimeError(
+            "authoritative timeline unavailable"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "timeline unavailable"):
+            await runtime.ingest_webhook(event)
+
+        runtime.store.ingest.assert_not_called()
+
+    async def test_comment_mode_does_not_enable_approval_adapter(self):
+        runtime, _ = self._runtime("pass", mode="comment")
+        event = self._approval_label_event()
+
+        await runtime.ingest_webhook(event)
+
+        runtime.approval_runtime.process_label_event.assert_not_called()
+        runtime.store.ingest.assert_called_once_with(event)
+
     def test_policy_report_keeps_required_action_before_bounded_path_evidence(self):
         paths = tuple(
             f"reviewer/{index}-" + "😀" * 500 + "\n@everyone"
@@ -172,24 +253,242 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
                 runtime.github.convert_pull_request_to_draft.assert_not_called()
                 runtime.github.squash_merge.assert_not_called()
 
-    async def test_auto_pass_is_blocked_without_atomic_backend(self):
+    async def test_comment_review_body_is_bound_to_exact_schema_three_context(self):
+        runtime, job = self._runtime("human_review")
+
+        await runtime.process_job(job)
+
+        body = runtime._create_review_once.await_args.kwargs["body"]
+        marker = body.splitlines()[0]
+        self.assertIn("repo=example/example-repo", marker)
+        self.assertIn("repo_id=1", marker)
+        self.assertIn(f"base={BASE_SHA}", marker)
+        self.assertIn(f"head={HEAD_SHA}", marker)
+        self.assertIn("diff=", marker)
+        self.assertIn("policy=1", marker)
+        self.assertIn("decision=human_review", marker)
+        self.assertTrue(marker.endswith("schema=3 -->"))
+
+    async def test_recreated_repository_identity_stops_before_analysis_or_write(self):
+        runtime, job = self._runtime("pass", mode="draft")
+        replaced = self._fresh_pull()
+        replaced["base"]["repo"]["id"] = 777
+        runtime.github.get_pull_request.side_effect = [replaced]
+
+        with self.assertRaisesRegex(RuntimeError, "identity changed"):
+            await runtime.process_job(job)
+
+        runtime._dispatch.assert_not_awaited()
+        runtime._create_review_once.assert_not_awaited()
+        runtime.github.add_labels.assert_not_called()
+        runtime.github.convert_pull_request_to_draft.assert_not_called()
+
+    async def test_comment_review_does_not_dismiss_stale_bot_block(self):
+        runtime, job = self._runtime("human_review")
+        marker = (
+            "<!-- dohwa-bot-review repo=example/example-repo repo_id=1 pr=10 "
+            f"base={BASE_SHA} head={HEAD_SHA} diff={'d' * 64} "
+            "policy=1 decision=human_review schema=3 -->"
+        )
+        stale = {
+            "id": 6,
+            "body": "<!-- stale -->",
+            "state": "CHANGES_REQUESTED",
+            "commit_id": HEAD_SHA,
+            "submitted_at": "2026-07-25T00:00:00Z",
+            "user": {"login": "example-reviewer[bot]", "type": "Bot"},
+        }
+        created = {
+            "id": 7,
+            "body": marker + "\nreview",
+            "state": "COMMENTED",
+            "commit_id": HEAD_SHA,
+            "submitted_at": "2026-07-25T00:01:00Z",
+            "user": {"login": "example-reviewer[bot]", "type": "Bot"},
+        }
+        runtime.github.list_pull_request_reviews.return_value = [stale]
+        runtime.github.create_review.return_value = created
+
+        result = await ReviewerRuntime._create_review_once(
+            runtime,
+            job,
+            body=marker + "\nreview",
+            event="COMMENT",
+        )
+
+        self.assertEqual(created, result)
+        runtime.github.dismiss_review.assert_not_called()
+
+    async def test_blocking_review_dismisses_stale_block_after_replacement(self):
+        runtime, job = self._runtime("changes_required", mode="draft")
+        marker = (
+            "<!-- dohwa-bot-review repo=example/example-repo repo_id=1 pr=10 "
+            f"base={BASE_SHA} head={HEAD_SHA} diff={'d' * 64} "
+            "policy=1 decision=changes_required schema=3 -->"
+        )
+        stale = {
+            "id": 6,
+            "body": "<!-- stale -->",
+            "state": "CHANGES_REQUESTED",
+            "commit_id": HEAD_SHA,
+            "submitted_at": "2026-07-25T00:00:00Z",
+            "user": {"login": "example-reviewer[bot]", "type": "Bot"},
+        }
+        created = {
+            "id": 7,
+            "body": marker + "\nreview",
+            "state": "CHANGES_REQUESTED",
+            "commit_id": HEAD_SHA,
+            "submitted_at": "2026-07-25T00:01:00Z",
+            "user": {"login": "example-reviewer[bot]", "type": "Bot"},
+        }
+        runtime.github.list_pull_request_reviews.return_value = [stale]
+        runtime.github.create_review.return_value = created
+
+        result = await ReviewerRuntime._create_review_once(
+            runtime,
+            job,
+            body=marker + "\nreview",
+            event="REQUEST_CHANGES",
+        )
+
+        self.assertEqual(created, result)
+        runtime.github.dismiss_review.assert_called_once_with(
+            REPOSITORY,
+            10,
+            6,
+            message="Superseded by a new exact review context.",
+        )
+
+    async def test_failed_blocking_replacement_keeps_stale_block(self):
+        runtime, job = self._runtime("changes_required", mode="draft")
+        marker = (
+            "<!-- dohwa-bot-review repo=example/example-repo repo_id=1 pr=10 "
+            f"base={BASE_SHA} head={HEAD_SHA} diff={'d' * 64} "
+            "policy=1 decision=changes_required schema=3 -->"
+        )
+        stale = {
+            "id": 6,
+            "body": "<!-- stale -->",
+            "state": "CHANGES_REQUESTED",
+            "commit_id": HEAD_SHA,
+            "submitted_at": "2026-07-25T00:00:00Z",
+            "user": {"login": "example-reviewer[bot]", "type": "Bot"},
+        }
+        runtime.github.list_pull_request_reviews.side_effect = [[stale], [stale]]
+        runtime.github.create_review.return_value = {}
+
+        with self.assertRaises(ReviewPublishUnknown):
+            await ReviewerRuntime._create_review_once(
+                runtime,
+                job,
+                body=marker + "\nreview",
+                event="REQUEST_CHANGES",
+            )
+
+        runtime.github.dismiss_review.assert_not_called()
+
+    async def test_ambiguous_review_post_reconciles_visible_exact_review(self):
+        runtime, job = self._runtime("changes_required", mode="draft")
+        marker = (
+            "<!-- dohwa-bot-review repo=example/example-repo repo_id=1 pr=10 "
+            f"base={BASE_SHA} head={HEAD_SHA} diff={'d' * 64} "
+            "policy=1 decision=changes_required schema=3 -->"
+        )
+        created = {
+            "id": 7,
+            "body": marker + "\nreview",
+            "state": "CHANGES_REQUESTED",
+            "commit_id": HEAD_SHA,
+            "submitted_at": "2026-07-25T00:01:00Z",
+            "user": {"login": "example-reviewer[bot]", "type": "Bot"},
+        }
+        runtime.store.begin_review_publication.return_value = True
+        runtime.github.list_pull_request_reviews.side_effect = [[], [created]]
+        runtime.github.create_review.side_effect = TimeoutError("response lost")
+
+        result = await ReviewerRuntime._create_review_once(
+            runtime,
+            job,
+            body=marker + "\nreview",
+            event="REQUEST_CHANGES",
+        )
+
+        self.assertEqual(created, result)
+        runtime.store.confirm_review_publication.assert_called_with(
+            job_id=job.id,
+            marker=marker,
+            event="REQUEST_CHANGES",
+            github_review_id=7,
+        )
+
+    async def test_unresolved_review_post_is_fenced_from_repost(self):
+        runtime, job = self._runtime("human_review")
+        marker = (
+            "<!-- dohwa-bot-review repo=example/example-repo repo_id=1 pr=10 "
+            f"base={BASE_SHA} head={HEAD_SHA} diff={'d' * 64} "
+            "policy=1 decision=human_review schema=3 -->"
+        )
+        runtime.store.begin_review_publication.side_effect = [True, False]
+        runtime.github.list_pull_request_reviews.return_value = []
+        runtime.github.create_review.side_effect = TimeoutError("response lost")
+
+        with self.assertRaises(ReviewPublishUnknown):
+            await ReviewerRuntime._create_review_once(
+                runtime,
+                job,
+                body=marker + "\nreview",
+                event="COMMENT",
+            )
+        with self.assertRaises(ReviewPublishUnknown):
+            await ReviewerRuntime._create_review_once(
+                runtime,
+                job,
+                body=marker + "\nreview",
+                event="COMMENT",
+            )
+
+        runtime.github.create_review.assert_called_once()
+
+    async def test_closed_after_analysis_is_recorded_terminal(self):
+        runtime, job = self._runtime("human_review")
+        initial = self._fresh_pull()
+        closed = self._fresh_pull()
+        closed["state"] = "closed"
+        runtime.github.get_pull_request.side_effect = [initial, closed]
+
+        await runtime.process_job(job)
+
+        runtime.store.transition.assert_called_once_with(
+            job.id,
+            ReviewState.CLOSED,
+            expected=ReviewState.REVIEWING,
+            merge_sha=None,
+        )
+        runtime._create_review_once.assert_not_awaited()
+
+    async def test_auto_pass_waits_for_exact_context_approval(self):
         runtime, job = self._runtime("pass", mode="auto")
 
         await runtime.process_job(job)
 
-        runtime._create_review_once.assert_awaited_once_with(
+        runtime._create_review_once.assert_not_awaited()
+        runtime.approval_runtime.publish_pass_review.assert_called_once_with(
             job,
+            pull=ANY,
+            diff=ANY,
             body=ANY,
-            event="COMMENT",
-        )
-        runtime.store.transition.assert_called_once_with(
-            job.id,
-            ReviewState.HUMAN_REVIEW,
-            expected=ReviewState.REVIEWING,
-            review_decision="pass",
             findings_hash=ANY,
-            github_review_id=7,
-            last_error="ATOMIC_SERVER_GATES_UNAVAILABLE",
+            policy=runtime.policies[REPOSITORY],
+        )
+        runtime.store.transition.assert_not_called()
+        self.assertEqual(
+            "명시적 승인 대기",
+            runtime._report.await_args.args[1],
+        )
+        self.assertIn(
+            "hermes:merge-approved",
+            runtime._report.await_args.args[2],
         )
         runtime.github.add_labels.assert_not_called()
         runtime.github.convert_pull_request_to_draft.assert_not_called()
@@ -202,7 +501,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
                 pull = self._fresh_pull()
                 confirmed = self._fresh_pull()
                 confirmed["draft"] = True
-                runtime.github.get_pull_request.side_effect = [pull] * 4 + [confirmed]
+                runtime.github.get_pull_request.side_effect = [pull] * 5 + [confirmed]
                 runtime.github.add_labels.return_value = [
                     {"name": "hermes:changes-requested"}
                 ]
@@ -253,7 +552,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
         pull = self._fresh_pull()
         confirmed = self._fresh_pull()
         confirmed["draft"] = True
-        runtime.github.get_pull_request.side_effect = [pull] * 4 + [confirmed]
+        runtime.github.get_pull_request.side_effect = [pull] * 5 + [confirmed]
         runtime._run_tests.return_value = {"tests": [], "all_passed": False}
         runtime.github.add_labels.return_value = [
             {"name": "hermes:changes-requested"}
@@ -285,11 +584,16 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
 
                 await runtime.process_job(job)
 
-                runtime._create_review_once.assert_awaited_once_with(
-                    job,
-                    body=ANY,
-                    event="COMMENT",
-                )
+                if decision == "pass":
+                    runtime._create_review_once.assert_not_awaited()
+                    runtime.approval_runtime.publish_pass_review.assert_called_once()
+                else:
+                    runtime._create_review_once.assert_awaited_once_with(
+                        job,
+                        body=ANY,
+                        event="COMMENT",
+                    )
+                    runtime.approval_runtime.publish_pass_review.assert_not_called()
                 runtime.github.add_labels.assert_not_called()
                 runtime.github.convert_pull_request_to_draft.assert_not_called()
                 runtime.github.squash_merge.assert_not_called()
@@ -362,6 +666,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
             current,
             current,
             current,
+            current,
             changed,
         ]
         runtime.github.add_labels.return_value = [
@@ -372,6 +677,12 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
 
         runtime.github.add_labels.assert_called_once()
         runtime.github.convert_pull_request_to_draft.assert_not_called()
+        runtime.github.dismiss_review.assert_called_once_with(
+            REPOSITORY,
+            10,
+            7,
+            message="Exact review context changed before Draft enforcement.",
+        )
         runtime.store.transition.assert_called_once_with(
             job.id,
             ReviewState.OBSOLETE,
@@ -384,6 +695,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
         changed = self._fresh_pull()
         changed["base"]["sha"] = "e" * 40
         runtime.github.get_pull_request.side_effect = [
+            current,
             current,
             current,
             current,
@@ -412,6 +724,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
             current,
             current,
             current,
+            current,
             closed,
         ]
         runtime.github.add_labels.return_value = [
@@ -437,6 +750,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
             "repo": {"full_name": REPOSITORY},
         }
         runtime.github.get_pull_request.side_effect = [
+            current,
             current,
             current,
             current,
@@ -471,6 +785,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
             current,
             current,
             current,
+            current,
             changed,
         ]
         runtime.github.add_labels.return_value = [
@@ -501,6 +816,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
             current,
             current,
             current,
+            current,
             closed,
         ]
         runtime.github.add_labels.return_value = [
@@ -524,7 +840,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_conversion_response_without_persisted_draft_fails_closed(self):
         runtime, job = self._runtime("changes_required", mode="draft")
         current = self._fresh_pull()
-        runtime.github.get_pull_request.side_effect = [current] * 5
+        runtime.github.get_pull_request.side_effect = [current] * 6
         runtime.github.add_labels.return_value = [
             {"name": "hermes:changes-requested"}
         ]
@@ -546,7 +862,8 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
         runtime.github.get_pull_request.side_effect = [
             initial,
             initial,
-            already_draft,
+            initial,
+            initial,
             already_draft,
         ]
         runtime.github.add_labels.return_value = [
@@ -576,7 +893,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(converted=converted):
                 runtime, job = self._runtime("changes_required", mode="draft")
                 pull = self._fresh_pull()
-                runtime.github.get_pull_request.side_effect = [pull] * 4
+                runtime.github.get_pull_request.side_effect = [pull] * 5
                 runtime.github.add_labels.return_value = [
                     {"name": "hermes:changes-requested"}
                 ]
@@ -591,7 +908,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_unconfirmed_changes_requested_label_stops_before_draft(self):
         runtime, job = self._runtime("changes_required", mode="draft")
         pull = self._fresh_pull()
-        runtime.github.get_pull_request.side_effect = [pull] * 3
+        runtime.github.get_pull_request.side_effect = [pull] * 4
         runtime.github.add_labels.return_value = [{"name": "other-label"}]
 
         with self.assertRaisesRegex(RuntimeError, "changes-requested label"):
@@ -606,7 +923,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
         pull = self._fresh_pull()
         confirmed = self._fresh_pull()
         confirmed["draft"] = True
-        runtime.github.get_pull_request.side_effect = [pull] * 4 + [confirmed]
+        runtime.github.get_pull_request.side_effect = [pull] * 5 + [confirmed]
         runtime.github.add_labels.return_value = [
             {"name": "hermes:changes-requested"}
         ]
@@ -655,7 +972,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
         pull = self._fresh_pull()
         confirmed = self._fresh_pull()
         confirmed["draft"] = True
-        runtime.github.get_pull_request.side_effect = [pull] * 4 + [confirmed]
+        runtime.github.get_pull_request.side_effect = [pull] * 5 + [confirmed]
         runtime.github.add_labels.return_value = [
             {"name": "hermes:changes-requested"}
         ]
@@ -683,12 +1000,42 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
             "html_url": "https://github.com/example/example-repo/pull/10",
             "node_id": "PR_node",
             "labels": [],
-            "base": {"ref": "main", "sha": BASE_SHA},
+            "base": {
+                "ref": "main",
+                "sha": BASE_SHA,
+                "repo": {"id": 1, "full_name": REPOSITORY},
+            },
             "head": {
                 "sha": HEAD_SHA,
                 "repo": {"full_name": REPOSITORY},
             },
         }
+
+    @staticmethod
+    def _approval_label_event() -> WebhookEvent:
+        return WebhookEvent(
+            delivery_id="delivery-label",
+            event_name="pull_request",
+            action="labeled",
+            repository_id=1,
+            repository=REPOSITORY,
+            installation_id=99,
+            pull_number=10,
+            base_sha=BASE_SHA,
+            head_sha=HEAD_SHA,
+            is_draft=False,
+            is_merged=False,
+            merge_sha=None,
+            label_id=1,
+            label_node_id="LA_approval",
+            label_name="hermes:merge-approved",
+            sender_id=303,
+            sender_node_id="U_303",
+            sender_login="approver",
+            sender_type="User",
+            pull_updated_at="2026-07-25T01:00:00Z",
+            payload_sha256="d" * 64,
+        )
 
     def _runtime(
         self, decision: str, *, mode: str = "comment"
@@ -700,7 +1047,11 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
             "html_url": "https://github.com/example/example-repo/pull/10",
             "node_id": "PR_node",
             "labels": [],
-            "base": {"ref": "main", "sha": BASE_SHA},
+            "base": {
+                "ref": "main",
+                "sha": BASE_SHA,
+                "repo": {"id": 1, "full_name": REPOSITORY},
+            },
             "head": {
                 "sha": HEAD_SHA,
                 "repo": {"full_name": REPOSITORY},
@@ -731,6 +1082,8 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
         runtime.settings = SimpleNamespace(mode=mode, app_slug="example-reviewer")
         runtime.github = github
         runtime.store = MagicMock()
+        runtime.approval_runtime = MagicMock()
+        runtime.approval_runtime.approval_label = "hermes:merge-approved"
         runtime.policies = {
             REPOSITORY: RepositoryPolicy(
                 full_name=REPOSITORY,
@@ -762,7 +1115,7 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
         runtime._run_tests = AsyncMock(return_value={"tests": [], "all_passed": True})
         runtime._report = AsyncMock(return_value=True)
         runtime._create_review_once = AsyncMock(return_value={"id": 7})
-        return runtime, ReviewJob(
+        job = ReviewJob(
             id=10,
             repository_id=1,
             repository=REPOSITORY,
@@ -786,6 +1139,10 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
             created_at="2026-07-24T00:00:00+00:00",
             updated_at="2026-07-24T00:00:00+00:00",
         )
+        runtime.approval_runtime.publish_pass_review.return_value = SimpleNamespace(
+            job=SimpleNamespace(state=ReviewState.READY_TO_MERGE)
+        )
+        return runtime, job
 
 
 if __name__ == "__main__":

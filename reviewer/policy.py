@@ -3,9 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
+
+
+_POLICY_VERSION = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 @dataclass(frozen=True)
@@ -32,9 +36,18 @@ class RepositoryPolicy:
     test_commands: tuple[tuple[str, ...], ...]
     required_checks: tuple[str, ...]
     writable_test_paths: tuple[str, ...]
+    policy_version: str = "1"
 
     @classmethod
-    def from_mapping(cls, full_name: str, value: dict[str, Any]) -> "RepositoryPolicy":
+    def from_mapping(
+        cls,
+        full_name: str,
+        value: dict[str, Any],
+        *,
+        policy_version: str = "1",
+    ) -> "RepositoryPolicy":
+        if _POLICY_VERSION.fullmatch(policy_version) is None:
+            raise ValueError("policy version must be canonical ASCII")
         limits = value.get("limits") or {}
         tests = value.get("tests") or []
         commands: list[tuple[str, ...]] = []
@@ -71,6 +84,7 @@ class RepositoryPolicy:
             test_commands=tuple(commands),
             required_checks=tuple(value.get("required_checks") or ()),
             writable_test_paths=writable_paths,
+            policy_version=policy_version,
         )
 
     def high_risk_files(self, paths: list[str]) -> list[str]:
@@ -164,10 +178,18 @@ def _path_matches(path: str, pattern: str) -> bool:
 
 def load_policies(path: Path) -> dict[str, RepositoryPolicy]:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    version = raw.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+        raise ValueError("policy version must be a positive integer")
+    policy_version = str(version)
     repositories = raw.get("repositories")
     if not isinstance(repositories, dict):
         raise ValueError("policy must contain a repositories mapping")
     return {
-        full_name: RepositoryPolicy.from_mapping(full_name, value or {})
+        full_name: RepositoryPolicy.from_mapping(
+            full_name,
+            value or {},
+            policy_version=policy_version,
+        )
         for full_name, value in repositories.items()
     }

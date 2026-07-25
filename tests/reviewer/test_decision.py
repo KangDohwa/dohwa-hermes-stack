@@ -5,10 +5,13 @@ from reviewer.decision import (
     ci_satisfies_policy,
     find_existing_review,
     find_review_attempt_review,
+    find_review_context_review,
     format_review,
     has_blocking_human_review,
     parse_review_attempt_marker,
+    parse_review_context_marker,
     review_attempt_marker,
+    review_context_marker,
 )
 from reviewer.review_schema import ReviewDecision, ReviewResult
 
@@ -113,6 +116,56 @@ class DecisionTests(unittest.TestCase):
                 actor="example-reviewer[bot]",
                 head_sha=SHA,
             )
+
+    def test_schema_three_marker_binds_exact_context_and_trusted_review(self):
+        marker = review_context_marker(
+            "Example/repository",
+            42,
+            7,
+            "b" * 40,
+            SHA,
+            "d" * 64,
+            "17",
+            ReviewDecision.CHANGES_REQUIRED,
+        )
+        parsed = parse_review_context_marker(marker)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(42, parsed.repository_id)
+        self.assertEqual("b" * 40, parsed.base_sha)
+        self.assertEqual("d" * 64, parsed.diff_sha256)
+        self.assertEqual("17", parsed.policy_version)
+        review = {
+            "id": 11,
+            "body": marker + "\nreview",
+            "state": "CHANGES_REQUESTED",
+            "commit_id": SHA,
+            "submitted_at": "2026-07-25T00:00:00Z",
+            "user": {"login": "example-reviewer[bot]", "type": "Bot"},
+        }
+        self.assertEqual(
+            review,
+            find_review_context_review(
+                [review],
+                marker,
+                event="REQUEST_CHANGES",
+                actor="example-reviewer[bot]",
+                head_sha=SHA,
+            ),
+        )
+        self.assertIsNone(
+            find_review_context_review(
+                [dict(review, commit_id="f" * 40)],
+                marker,
+                event="REQUEST_CHANGES",
+                actor="example-reviewer[bot]",
+                head_sha=SHA,
+            )
+        )
+        self.assertIsNone(
+            parse_review_context_marker(marker.replace("base=" + "b" * 40,
+                                                       "base=" + "B" * 40))
+        )
 
     def test_ci_requires_explicit_named_success(self):
         self.assertFalse(ci_satisfies_policy((), [], {"state": "success"}))

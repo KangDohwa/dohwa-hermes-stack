@@ -117,7 +117,12 @@ class ReviewerComposeSecurityTests(unittest.TestCase):
 
     def test_runtime_is_comment_only_and_scoped_to_public_target(self) -> None:
         environment = self.services["review-orchestrator"]["environment"]
-        self.assertEqual("comment", environment["REVIEWER_MODE"])
+        self.assertEqual("${REVIEWER_MODE:-comment}", environment["REVIEWER_MODE"])
+        self.assertEqual("${REVIEWER_APPROVER_IDS:-}", environment["REVIEWER_APPROVER_IDS"])
+        self.assertEqual(
+            "${REVIEWER_APPROVAL_LABEL:-hermes:merge-approved}",
+            environment["REVIEWER_APPROVAL_LABEL"],
+        )
         self.assertEqual(
             "${REVIEWER_REPOSITORIES:-KangDohwa/dohwa-hermes-stack}",
             environment["REVIEWER_REPOSITORIES"],
