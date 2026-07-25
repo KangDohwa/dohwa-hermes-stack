@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import unittest
 
@@ -25,6 +26,32 @@ def body_for(**overrides):
         "number": 7,
         "pull_request": {
             "number": 7,
+            "draft": False,
+            "merged": False,
+            "merge_commit_sha": None,
+            "base": {"sha": "b" * 40},
+            "head": {"sha": "a" * 40},
+        },
+    }
+    payload.update(overrides)
+    return json.dumps(payload, separators=(",", ":")).encode()
+
+
+def label_body_for(action="labeled", **overrides):
+    payload = {
+        "action": action,
+        "installation": {"id": 321},
+        "repository": {"id": 456, "full_name": "example/example-repo"},
+        "number": 7,
+        "label": {
+            "id": 654,
+            "node_id": "LA_label_654",
+            "name": "hermes:merge-approved",
+        },
+        "sender": {"id": 987, "node_id": "U_sender_987", "login": "approver"},
+        "pull_request": {
+            "number": 7,
+            "updated_at": "2026-07-25T01:02:03Z",
             "draft": False,
             "merged": False,
             "merge_commit_sha": None,
@@ -169,6 +196,90 @@ class ParseWebhookTests(unittest.TestCase):
                 raw_body,
                 SECRET,
             )
+
+    def test_label_actions_preserve_strict_signed_evidence(self):
+        for action in ("labeled", "unlabeled"):
+            with self.subTest(action=action):
+                raw_body = label_body_for(action)
+                event = parse_webhook(
+                    {
+                        "X-GitHub-Delivery": f"delivery-{action}",
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": signature_for(raw_body, SECRET),
+                    },
+                    raw_body,
+                    SECRET,
+                )
+
+                self.assertEqual(action, event.action)
+                self.assertEqual(654, event.label_id)
+                self.assertEqual("LA_label_654", event.label_node_id)
+                self.assertEqual("hermes:merge-approved", event.label_name)
+                self.assertEqual(987, event.sender_id)
+                self.assertEqual("U_sender_987", event.sender_node_id)
+                self.assertEqual("approver", event.sender_login)
+                self.assertEqual("2026-07-25T01:02:03Z", event.pull_updated_at)
+                self.assertEqual(
+                    hashlib.sha256(raw_body).hexdigest(), event.payload_sha256
+                )
+
+    def test_label_action_rejects_missing_or_invalid_signed_evidence(self):
+        valid = json.loads(label_body_for())
+        mutations = (
+            lambda value: value["repository"].pop("id"),
+            lambda value: value["installation"].update(id=True),
+            lambda value: value["label"].update(id=0),
+            lambda value: value["label"].pop("node_id"),
+            lambda value: value["label"].update(name=""),
+            lambda value: value["sender"].update(id=False),
+            lambda value: value["sender"].pop("node_id"),
+            lambda value: value["sender"].pop("login"),
+            lambda value: value["pull_request"].pop("updated_at"),
+            lambda value: value["pull_request"].update(updated_at="not-a-time"),
+            lambda value: value["pull_request"]["base"].update(sha="B" * 40),
+            lambda value: value["pull_request"]["head"].update(sha="a" * 64),
+            lambda value: value["pull_request"].update(
+                updated_at="2026-07-25T01:02:03+00:00"
+            ),
+            lambda value: value["pull_request"].update(
+                updated_at="2026-07-25T01:02:03.000Z"
+            ),
+            lambda value: value["pull_request"].update(
+                updated_at="2026-07-25T01:02:03z"
+            ),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                payload = json.loads(json.dumps(valid))
+                mutate(payload)
+                raw_body = json.dumps(payload, separators=(",", ":")).encode()
+                with self.assertRaisesRegex(InvalidPayload, "signed event evidence"):
+                    parse_webhook(
+                        {
+                            "X-GitHub-Delivery": f"invalid-label-{index}",
+                            "X-GitHub-Event": "pull_request",
+                            "X-Hub-Signature-256": signature_for(raw_body, SECRET),
+                        },
+                        raw_body,
+                        SECRET,
+                    )
+
+    def test_non_label_action_remains_compatible_without_label_evidence(self):
+        raw_body = body_for(action="synchronize")
+        event = parse_webhook(
+            {
+                "X-GitHub-Delivery": "delivery-synchronize",
+                "X-GitHub-Event": "pull_request",
+                "X-Hub-Signature-256": signature_for(raw_body, SECRET),
+            },
+            raw_body,
+            SECRET,
+        )
+
+        self.assertEqual("synchronize", event.action)
+        self.assertIsNone(event.label_id)
+        self.assertIsNone(event.sender_id)
+        self.assertIsNone(event.pull_updated_at)
 
 
 class LimitedBodyTests(unittest.TestCase):

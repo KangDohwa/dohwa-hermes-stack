@@ -100,6 +100,33 @@ class GitHubAPIError(RuntimeError):
         return f"{prefix}{self.message}{suffix}"
 
 
+@dataclass(frozen=True, slots=True)
+class LabelTimelineEvent:
+    event_id: str
+    action: str
+    created_at: str
+    actor_type: str | None
+    actor_node_id: str | None
+    actor_database_id: int | None
+    actor_login: str | None
+    label_node_id: str
+    label_name: str
+    cursor: str
+    ordinal: int
+    predecessor_event_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LabelTimelineSnapshot:
+    repository_node_id: str
+    repository_database_id: int
+    repository: str
+    pull_number: int
+    timeline_updated_at: str
+    total_count: int
+    events: tuple[LabelTimelineEvent, ...]
+
+
 UrlOpen = Callable[..., Any]
 
 
@@ -812,6 +839,224 @@ class GitHubClient:
             raise GitHubAPIError("GitHub returned invalid label data")
         return payload
 
+    def remove_label(
+        self, repository: str, pull_number: int, label: str
+    ) -> list[dict[str, Any]]:
+        if not isinstance(label, str) or not label:
+            raise ValueError("label must not be empty")
+        payload = self._request(
+            repository,
+            "DELETE",
+            f"{self._repo_path(repository)}/issues/{self._number(pull_number)}"
+            f"/labels/{parse.quote(label, safe='')}",
+            expected_statuses=(200,),
+        )
+        if not isinstance(payload, list) or not all(
+            isinstance(item, dict)
+            and self._is_positive_int(item.get("id"))
+            and isinstance(item.get("node_id"), str)
+            and bool(item["node_id"])
+            and isinstance(item.get("name"), str)
+            and bool(item["name"])
+            for item in payload
+        ):
+            raise GitHubAPIError("GitHub returned invalid label data")
+        return payload
+
+    def list_pull_request_label_timeline(
+        self, repository: str, pull_number: int
+    ) -> LabelTimelineSnapshot:
+        canonical = self.auth.require_allowed_repository(repository)
+        number = self._number(pull_number)
+        owner, name = canonical.split("/", 1)
+        query = (
+            "query PullRequestLabelTimeline("
+            "$owner: String!, $name: String!, $number: Int!, "
+            "$first: Int!, $after: String) {"
+            " repository(owner: $owner, name: $name) {"
+            " id databaseId nameWithOwner"
+            " pullRequest(number: $number) {"
+            " number"
+            " timelineItems("
+            "first: $first, after: $after, "
+            "itemTypes: [LABELED_EVENT, UNLABELED_EVENT]) {"
+            " updatedAt filteredCount"
+            " edges {"
+            " cursor"
+            " node {"
+            " __typename"
+            " ... on LabeledEvent {"
+            " id createdAt"
+            " actor {"
+            " __typename login"
+            " ... on Node { id }"
+            " ... on Bot { databaseId }"
+            " ... on Mannequin { databaseId }"
+            " ... on Organization { databaseId }"
+            " ... on User { databaseId }"
+            " }"
+            " label { id name }"
+            " }"
+            " ... on UnlabeledEvent {"
+            " id createdAt"
+            " actor {"
+            " __typename login"
+            " ... on Node { id }"
+            " ... on Bot { databaseId }"
+            " ... on Mannequin { databaseId }"
+            " ... on Organization { databaseId }"
+            " ... on User { databaseId }"
+            " }"
+            " label { id name }"
+            " }"
+            " }"
+            " }"
+            " pageInfo { hasNextPage endCursor }"
+            " }"
+            " }"
+            " }"
+            "}"
+        )
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        seen_event_ids: set[str] = set()
+        events: list[LabelTimelineEvent] = []
+        identity: tuple[str, int, str, int] | None = None
+        timeline_identity: tuple[str, int] | None = None
+        previous_created_at: datetime | None = None
+
+        for _page in range(100):
+            data = self._graphql(
+                canonical,
+                query,
+                {
+                    "owner": owner,
+                    "name": name,
+                    "number": number,
+                    "first": 100,
+                    "after": cursor,
+                },
+            )
+            page_identity, page_timeline, edges, page_info = (
+                self._parse_label_timeline_page(
+                    data, canonical=canonical, pull_number=number
+                )
+            )
+            if identity is None:
+                identity = page_identity
+                timeline_identity = page_timeline
+            elif identity != page_identity or timeline_identity != page_timeline:
+                self._label_timeline_error(
+                    "GitHub label timeline changed during pagination"
+                )
+
+            if cursor is not None and not edges:
+                self._label_timeline_error(
+                    "GitHub label timeline returned an empty intermediate page"
+                )
+            for edge in edges:
+                event_id = edge["event_id"]
+                edge_cursor = edge["cursor"]
+                if event_id in seen_event_ids or edge_cursor in seen_cursors:
+                    self._label_timeline_error(
+                        "GitHub label timeline repeated an event or cursor"
+                    )
+                created_at = self._label_timeline_datetime(
+                    edge["created_at"], "event createdAt"
+                )
+                if previous_created_at is not None and created_at < previous_created_at:
+                    self._label_timeline_error(
+                        "GitHub label timeline event order moved backwards"
+                    )
+                previous_created_at = created_at
+                predecessor = events[-1].event_id if events else None
+                events.append(
+                    LabelTimelineEvent(
+                        event_id=event_id,
+                        action=edge["action"],
+                        created_at=edge["created_at"],
+                        actor_node_id=edge["actor_node_id"],
+                        actor_type=edge["actor_type"],
+                        actor_database_id=edge["actor_database_id"],
+                        actor_login=edge["actor_login"],
+                        label_node_id=edge["label_node_id"],
+                        label_name=edge["label_name"],
+                        cursor=edge_cursor,
+                        ordinal=len(events) + 1,
+                        predecessor_event_id=predecessor,
+                    )
+                )
+                seen_event_ids.add(event_id)
+                seen_cursors.add(edge_cursor)
+
+            has_next_page = page_info["hasNextPage"]
+            end_cursor = page_info["endCursor"]
+            if edges and end_cursor != edges[-1]["cursor"]:
+                self._label_timeline_error(
+                    "GitHub label timeline end cursor does not match page order"
+                )
+            if not has_next_page:
+                break
+            if not isinstance(end_cursor, str) or not end_cursor:
+                self._label_timeline_error(
+                    "GitHub label timeline has an invalid next cursor"
+                )
+            cursor = end_cursor
+        else:
+            self._label_timeline_error(
+                "GitHub label timeline pagination exceeded 100 pages"
+            )
+
+        assert identity is not None
+        assert timeline_identity is not None
+        if len(events) != timeline_identity[1]:
+            self._label_timeline_error(
+                "GitHub label timeline count does not match its events"
+            )
+
+        watermark_data = self._graphql(
+            canonical,
+            query,
+            {
+                "owner": owner,
+                "name": name,
+                "number": number,
+                "first": 1,
+                "after": None,
+            },
+        )
+        watermark_identity, watermark_timeline, watermark_edges, _ = (
+            self._parse_label_timeline_page(
+                watermark_data, canonical=canonical, pull_number=number
+            )
+        )
+        first_identity = (
+            (events[0].event_id, events[0].cursor) if events else None
+        )
+        watermark_first = (
+            (watermark_edges[0]["event_id"], watermark_edges[0]["cursor"])
+            if watermark_edges
+            else None
+        )
+        if (
+            watermark_identity != identity
+            or watermark_timeline != timeline_identity
+            or watermark_first != first_identity
+        ):
+            self._label_timeline_error(
+                "GitHub label timeline changed before verification completed"
+            )
+
+        return LabelTimelineSnapshot(
+            repository_node_id=identity[0],
+            repository_database_id=identity[1],
+            repository=identity[2],
+            pull_number=identity[3],
+            timeline_updated_at=timeline_identity[0],
+            total_count=timeline_identity[1],
+            events=tuple(events),
+        )
+
     def has_unresolved_review_threads(
         self, repository: str, pull_number: int
     ) -> bool:
@@ -950,6 +1195,159 @@ class GitHubClient:
                 str(result.get("message") or "GitHub did not merge the pull request")
             )
         return result
+
+    def _parse_label_timeline_page(
+        self,
+        data: Mapping[str, Any],
+        *,
+        canonical: str,
+        pull_number: int,
+    ) -> tuple[
+        tuple[str, int, str, int],
+        tuple[str, int],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]:
+        repository_data = data.get("repository")
+        if not isinstance(repository_data, dict):
+            self._label_timeline_error(
+                "GitHub returned invalid label-timeline repository data"
+            )
+        repository_node_id = repository_data.get("id")
+        repository_database_id = repository_data.get("databaseId")
+        repository_name = repository_data.get("nameWithOwner")
+        pull_data = repository_data.get("pullRequest")
+        if (
+            not isinstance(repository_node_id, str)
+            or not repository_node_id
+            or not self._is_positive_int(repository_database_id)
+            or repository_name != canonical
+            or not isinstance(pull_data, dict)
+            or pull_data.get("number") != pull_number
+        ):
+            self._label_timeline_error(
+                "GitHub returned mismatched label-timeline identity"
+            )
+
+        timeline = pull_data.get("timelineItems")
+        if not isinstance(timeline, dict):
+            self._label_timeline_error(
+                "GitHub returned invalid label-timeline connection data"
+            )
+        updated_at = timeline.get("updatedAt")
+        self._label_timeline_datetime(updated_at, "timeline updatedAt")
+        total_count = timeline.get("filteredCount")
+        edges_data = timeline.get("edges")
+        page_info = timeline.get("pageInfo")
+        if (
+            not isinstance(total_count, int)
+            or isinstance(total_count, bool)
+            or total_count < 0
+            or not isinstance(edges_data, list)
+            or not isinstance(page_info, dict)
+            or not isinstance(page_info.get("hasNextPage"), bool)
+            or not (
+                page_info.get("endCursor") is None
+                or (
+                    isinstance(page_info.get("endCursor"), str)
+                    and bool(page_info["endCursor"])
+                )
+            )
+        ):
+            self._label_timeline_error(
+                "GitHub returned invalid label-timeline page data"
+            )
+
+        edges: list[dict[str, Any]] = []
+        for edge in edges_data:
+            if not isinstance(edge, dict):
+                self._label_timeline_error(
+                    "GitHub returned invalid label-timeline edge"
+                )
+            cursor = edge.get("cursor")
+            node = edge.get("node")
+            if not isinstance(cursor, str) or not cursor or not isinstance(node, dict):
+                self._label_timeline_error(
+                    "GitHub returned invalid label-timeline edge"
+                )
+            typename = node.get("__typename")
+            if typename not in {"LabeledEvent", "UnlabeledEvent"}:
+                self._label_timeline_error(
+                    "GitHub returned an unexpected label-timeline event type"
+                )
+            event_id = node.get("id")
+            created_at = node.get("createdAt")
+            actor = node.get("actor")
+            label = node.get("label")
+            actor_type: str | None = None
+            actor_node_id: str | None = None
+            actor_database_id: int | None = None
+            actor_login: str | None = None
+            if actor is not None:
+                if not isinstance(actor, dict):
+                    self._label_timeline_error(
+                        "GitHub returned invalid label-timeline actor data"
+                    )
+                actor_type = actor.get("__typename")
+                actor_node_id = actor.get("id")
+                actor_database_id = actor.get("databaseId")
+                actor_login = actor.get("login")
+                if (
+                    not isinstance(actor_type, str)
+                    or not actor_type
+                    or not isinstance(actor_login, str)
+                    or not actor_login
+                    or not (
+                        actor_node_id is None
+                        or (isinstance(actor_node_id, str) and bool(actor_node_id))
+                    )
+                    or not (
+                        actor_database_id is None
+                        or self._is_positive_int(actor_database_id)
+                    )
+                ):
+                    self._label_timeline_error(
+                        "GitHub returned invalid label-timeline actor identity"
+                    )
+            self._label_timeline_datetime(created_at, "event createdAt")
+            if (
+                not isinstance(event_id, str)
+                or not event_id
+                or not isinstance(label, dict)
+                or not isinstance(label.get("id"), str)
+                or not label["id"]
+                or not isinstance(label.get("name"), str)
+                or not label["name"]
+            ):
+                self._label_timeline_error(
+                    "GitHub returned invalid label-timeline event identity"
+                )
+            edges.append(
+                {
+                    "event_id": event_id,
+                    "action": "labeled" if typename == "LabeledEvent" else "unlabeled",
+                    "created_at": created_at,
+                    "actor_type": actor_type,
+                    "actor_node_id": actor_node_id,
+                    "actor_database_id": actor_database_id,
+                    "actor_login": actor_login,
+                    "label_node_id": label["id"],
+                    "label_name": label["name"],
+                    "cursor": cursor,
+                }
+            )
+
+        return (
+            (
+                repository_node_id,
+                repository_database_id,
+                repository_name,
+                pull_number,
+            ),
+            (updated_at, total_count),
+            edges,
+            page_info,
+        )
 
     def _paginate(self, repository: str, path: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -1103,6 +1501,36 @@ class GitHubClient:
     @staticmethod
     def _ci_error(code: str, message: str) -> None:
         raise GitHubAPIError(message, code=code)
+
+    @staticmethod
+    def _is_positive_int(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    @staticmethod
+    def _label_timeline_datetime(value: object, name: str) -> datetime:
+        if not isinstance(value, str) or not value:
+            GitHubClient._label_timeline_error(
+                f"GitHub label timeline has invalid {name}"
+            )
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise GitHubAPIError(
+                f"GitHub label timeline has invalid {name}",
+                code="LABEL_TIMELINE_DISCONTINUITY",
+            ) from exc
+        if parsed.tzinfo is None:
+            GitHubClient._label_timeline_error(
+                f"GitHub label timeline has invalid {name}"
+            )
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _label_timeline_error(message: str) -> None:
+        raise GitHubAPIError(
+            message,
+            code="LABEL_TIMELINE_DISCONTINUITY",
+        )
 
     def _repo_path(self, repository: str) -> str:
         canonical = self.auth.require_allowed_repository(repository)

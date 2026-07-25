@@ -43,6 +43,7 @@ MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
 WEBHOOK_CONCURRENCY = 8
 WEBHOOK_ACQUIRE_TIMEOUT_SECONDS = 0.25
 WEBHOOK_SLOTS = asyncio.Semaphore(WEBHOOK_CONCURRENCY)
+CHANGES_REQUESTED_LABEL = "hermes:changes-requested"
 
 
 class ReviewerRuntime:
@@ -287,20 +288,136 @@ class ReviewerRuntime:
                 event=review_event,
             )
             if self.settings.mode in {"draft", "auto"}:
-                await asyncio.to_thread(
+                pre_label = await asyncio.to_thread(
+                    self.github.get_pull_request,
+                    job.repository,
+                    job.pull_number,
+                )
+                if not self._draft_candidate_matches_job(pre_label, job):
+                    self.store.transition(
+                        job.id,
+                        ReviewState.OBSOLETE,
+                        expected=ReviewState.REVIEWING,
+                    )
+                    return
+                if pre_label.get("state") != "open":
+                    target = (
+                        ReviewState.MERGED
+                        if pre_label.get("merged")
+                        else ReviewState.CLOSED
+                    )
+                    self.store.transition(
+                        job.id,
+                        target,
+                        expected=ReviewState.REVIEWING,
+                    )
+                    return
+                labels = await asyncio.to_thread(
+                    self.github.add_labels,
+                    job.repository,
+                    job.pull_number,
+                    [CHANGES_REQUESTED_LABEL],
+                )
+                if not any(
+                    isinstance(item, dict)
+                    and item.get("name") == CHANGES_REQUESTED_LABEL
+                    for item in labels
+                ):
+                    raise RuntimeError(
+                        "GitHub did not confirm changes-requested label"
+                    )
+                pre_convert = await asyncio.to_thread(
+                    self.github.get_pull_request,
+                    job.repository,
+                    job.pull_number,
+                )
+                if not self._draft_candidate_matches_job(pre_convert, job):
+                    self.store.transition(
+                        job.id,
+                        ReviewState.OBSOLETE,
+                        expected=ReviewState.REVIEWING,
+                    )
+                    return
+                if pre_convert.get("state") != "open":
+                    target = (
+                        ReviewState.MERGED
+                        if pre_convert.get("merged")
+                        else ReviewState.CLOSED
+                    )
+                    self.store.transition(
+                        job.id,
+                        target,
+                        expected=ReviewState.REVIEWING,
+                    )
+                    return
+                if pre_convert.get("draft") is True:
+                    self._transition_after_draft_confirmation(
+                        job,
+                        review_decision=final_decision.value,
+                        findings_hash=findings_hash,
+                        github_review_id=_optional_id(review),
+                    )
+                    await self._report(
+                        job, "수정 필요", result.summary, pull=pre_convert
+                    )
+                    return
+                converted = await asyncio.to_thread(
                     self.github.convert_pull_request_to_draft,
                     job.repository,
                     job.pull_number,
-                    pull_request_node_id=current.get("node_id"),
+                    pull_request_node_id=pre_convert.get("node_id"),
                 )
-            self.store.transition(
-                job.id,
-                ReviewState.CHANGES_REQUIRED,
-                expected=ReviewState.REVIEWING,
-                review_decision=final_decision.value,
-                findings_hash=findings_hash,
-                github_review_id=_optional_id(review),
-            )
+                if converted.get("isDraft") is not True:
+                    raise RuntimeError(
+                        "GitHub did not confirm pull request draft conversion"
+                    )
+                confirmed_draft = await asyncio.to_thread(
+                    self.github.get_pull_request,
+                    job.repository,
+                    job.pull_number,
+                )
+                if not self._draft_candidate_matches_job(confirmed_draft, job):
+                    self.store.transition(
+                        job.id,
+                        ReviewState.OBSOLETE,
+                        expected=ReviewState.REVIEWING,
+                    )
+                    return
+                if confirmed_draft.get("state") != "open":
+                    target = (
+                        ReviewState.MERGED
+                        if confirmed_draft.get("merged")
+                        else ReviewState.CLOSED
+                    )
+                    self.store.transition(
+                        job.id,
+                        target,
+                        expected=ReviewState.REVIEWING,
+                    )
+                    return
+                if confirmed_draft.get("draft") is not True:
+                    raise RuntimeError(
+                        "GitHub did not persist pull request draft conversion"
+                    )
+                self._transition_after_draft_confirmation(
+                    job,
+                    review_decision=final_decision.value,
+                    findings_hash=findings_hash,
+                    github_review_id=_optional_id(review),
+                )
+                await self._report(
+                    job, "수정 필요", result.summary, pull=confirmed_draft
+                )
+                return
+            else:
+                self.store.transition(
+                    job.id,
+                    ReviewState.CHANGES_REQUIRED,
+                    expected=ReviewState.REVIEWING,
+                    review_decision=final_decision.value,
+                    findings_hash=findings_hash,
+                    github_review_id=_optional_id(review),
+                )
             await self._report(job, "수정 필요", result.summary, pull=current)
             return
 
@@ -341,6 +458,55 @@ class ReviewerRuntime:
             "병합 중단",
             "원자적 병합 backend가 아직 검증·활성화되지 않아 자동 병합을 차단했습니다.",
             pull=current,
+        )
+
+    def _transition_after_draft_confirmation(
+        self,
+        job: ReviewJob,
+        *,
+        review_decision: str,
+        findings_hash: str,
+        github_review_id: int | None,
+    ) -> None:
+        try:
+            self.store.transition(
+                job.id,
+                ReviewState.WAITING_READY,
+                expected=ReviewState.REVIEWING,
+                review_decision=review_decision,
+                findings_hash=findings_hash,
+                github_review_id=github_review_id,
+            )
+        except RuntimeError as exc:
+            persisted = self.store.get_job_by_id(job.id)
+            expected_error = (
+                f"job {job.id} is {ReviewState.WAITING_READY}, "
+                f"expected {ReviewState.REVIEWING}"
+            )
+            if (
+                str(exc) != expected_error
+                or persisted is None
+                or persisted.state is not ReviewState.WAITING_READY
+            ):
+                raise
+            self.store.transition(
+                job.id,
+                ReviewState.WAITING_READY,
+                expected=ReviewState.WAITING_READY,
+                review_decision=review_decision,
+                findings_hash=findings_hash,
+                github_review_id=github_review_id,
+            )
+
+    @staticmethod
+    def _draft_candidate_matches_job(
+        pull: dict[str, Any], job: ReviewJob
+    ) -> bool:
+        head_sha = str(((pull.get("head") or {}).get("sha") or "")).lower()
+        base_sha = str(((pull.get("base") or {}).get("sha") or "")).lower()
+        return (
+            head_sha == job.head_sha.lower()
+            and base_sha == job.base_sha.lower()
         )
 
     async def _finish_ineligible(self, job: ReviewJob, pull: dict[str, Any], eligibility: Eligibility) -> None:

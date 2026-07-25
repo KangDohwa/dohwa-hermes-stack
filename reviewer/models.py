@@ -154,6 +154,14 @@ class WebhookEvent:
     is_draft: bool | None
     is_merged: bool | None
     merge_sha: str | None
+    label_id: int | None = None
+    label_node_id: str | None = None
+    label_name: str | None = None
+    sender_id: int | None = None
+    sender_node_id: str | None = None
+    sender_login: str | None = None
+    pull_updated_at: str | None = None
+    payload_sha256: str | None = None
 
     @property
     def has_pull_request(self) -> bool:

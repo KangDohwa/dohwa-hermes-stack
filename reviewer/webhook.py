@@ -5,6 +5,7 @@ import hmac
 import json
 import re
 from collections.abc import AsyncIterator, Mapping
+from datetime import datetime
 from typing import Any
 
 from reviewer.models import WebhookEvent
@@ -103,10 +104,16 @@ def parse_webhook(
 
     base = pull_request.get("base")
     head = pull_request.get("head")
+    label = payload.get("label")
+    sender = payload.get("sender")
     if not isinstance(base, dict):
         base = {}
     if not isinstance(head, dict):
         head = {}
+    if not isinstance(label, dict):
+        label = {}
+    if not isinstance(sender, dict):
+        sender = {}
 
     event = WebhookEvent(
         delivery_id=delivery_id,
@@ -123,6 +130,14 @@ def parse_webhook(
         is_draft=_optional_bool(pull_request.get("draft")),
         is_merged=_optional_bool(pull_request.get("merged")),
         merge_sha=_optional_str(pull_request.get("merge_commit_sha")),
+        label_id=_optional_int(label.get("id")),
+        label_node_id=_optional_str(label.get("node_id")),
+        label_name=_optional_str(label.get("name")),
+        sender_id=_optional_int(sender.get("id")),
+        sender_node_id=_optional_str(sender.get("node_id")),
+        sender_login=_optional_str(sender.get("login")),
+        pull_updated_at=_optional_str(pull_request.get("updated_at")),
+        payload_sha256=hashlib.sha256(raw_body).hexdigest(),
     )
     if event_name == "pull_request":
         if (
@@ -136,6 +151,23 @@ def parse_webhook(
             raise InvalidPayload("merged pull_request payload is missing merge SHA")
         if event.merge_sha is not None and not _is_sha(event.merge_sha):
             raise InvalidPayload("pull_request payload has an invalid merge SHA")
+        if event.action in {"labeled", "unlabeled"}:
+            if (
+                not _is_positive_int(event.repository_id)
+                or not _is_positive_int(event.installation_id)
+                or not _is_positive_int(event.label_id)
+                or not event.label_node_id
+                or not event.label_name
+                or not _is_positive_int(event.sender_id)
+                or not event.sender_node_id
+                or not event.sender_login
+                or not _is_exact_lower_sha(event.base_sha)
+                or not _is_exact_lower_sha(event.head_sha)
+                or not _is_canonical_github_datetime(event.pull_updated_at)
+            ):
+                raise InvalidPayload(
+                    "label pull_request payload is missing signed event evidence"
+                )
     return event
 
 
@@ -162,6 +194,26 @@ def _optional_int(value: object) -> int | None:
 
 def _optional_bool(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+def _is_positive_int(value: int | None) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _is_canonical_github_datetime(value: str | None) -> bool:
+    if not isinstance(value, str) or len(value) != 20:
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ") == value
+
+
+def _is_exact_lower_sha(value: str | None) -> bool:
+    return bool(value and re.fullmatch(r"[0-9a-f]{40}", value))
+
+
 
 
 def _is_sha(value: str | None) -> bool:
