@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import json
 import unittest
-from urllib import parse
+from urllib import error, parse
 
 from reviewer.github_auth import GitHubAuthError
 from reviewer.github_client import GitHubAPIError, GitHubClient, WorkflowIdentity
@@ -66,7 +66,10 @@ class RecordingTransport:
         self.requests.append(api_request)
         if not self.responses:
             raise AssertionError(f"unexpected request: {api_request.full_url}")
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 class BinaryResponse(FakeResponse):
@@ -162,6 +165,71 @@ class GitHubClientTests(unittest.TestCase):
         }
         value.update(overrides)
         return value
+
+    @staticmethod
+    def label_timeline_event(
+        event_id,
+        cursor,
+        *,
+        typename="LabeledEvent",
+        created_at="2026-07-25T01:02:03Z",
+        actor_type="User",
+        actor_node_id="U_sender_987",
+        actor_database_id=987,
+        actor_login="approver",
+    ):
+        return {
+            "cursor": cursor,
+            "node": {
+                "__typename": typename,
+                "id": event_id,
+                "createdAt": created_at,
+                "actor": None if actor_type is None else {
+                    "__typename": actor_type,
+                    "id": actor_node_id,
+                    "databaseId": actor_database_id,
+                    "login": actor_login,
+                },
+                "label": {
+                    "id": "LA_label_654",
+                    "name": "hermes:merge-approved",
+                },
+            },
+        }
+
+    @staticmethod
+    def label_timeline_response(
+        edges,
+        *,
+        total_count=None,
+        updated_at="2026-07-25T01:03:00Z",
+        has_next_page=False,
+        end_cursor=None,
+        repository_name=REPOSITORY,
+    ):
+        return FakeResponse(
+            {
+                "data": {
+                    "repository": {
+                        "id": "R_repo_99",
+                        "databaseId": 99,
+                        "nameWithOwner": repository_name,
+                        "pullRequest": {
+                            "number": 7,
+                            "timelineItems": {
+                                "updatedAt": updated_at,
+                                "filteredCount": len(edges) if total_count is None else total_count,
+                                "edges": edges,
+                                "pageInfo": {
+                                    "hasNextPage": has_next_page,
+                                    "endCursor": end_cursor,
+                                },
+                            },
+                        },
+                    },
+                },
+            }
+        )
 
 
     def test_workflow_identity_requires_canonical_pinned_values(self):
@@ -1031,6 +1099,216 @@ class GitHubClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.download_tarball(REPOSITORY, "main")
         self.assertEqual(self.transport.requests, [])
+
+    def test_label_timeline_paginates_in_authoritative_edge_order(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        second = self.label_timeline_event(
+            "UE_2",
+            "cursor-2",
+            typename="UnlabeledEvent",
+            created_at="2026-07-25T01:02:04Z",
+        )
+        client = self.make_client(
+            [
+                self.label_timeline_response(
+                    [first],
+                    total_count=2,
+                    has_next_page=True,
+                    end_cursor="cursor-1",
+                ),
+                self.label_timeline_response(
+                    [second], total_count=2, end_cursor="cursor-2"
+                ),
+                self.label_timeline_response(
+                    [first],
+                    total_count=2,
+                    has_next_page=True,
+                    end_cursor="cursor-1",
+                ),
+            ]
+        )
+
+        snapshot = client.list_pull_request_label_timeline(REPOSITORY, 7)
+
+        self.assertEqual(99, snapshot.repository_database_id)
+        self.assertEqual(2, snapshot.total_count)
+        self.assertEqual(["labeled", "unlabeled"], [e.action for e in snapshot.events])
+        self.assertEqual([1, 2], [e.ordinal for e in snapshot.events])
+        self.assertIsNone(snapshot.events[0].predecessor_event_id)
+        self.assertEqual("LE_1", snapshot.events[1].predecessor_event_id)
+        requests = [self.request_json(item) for item in self.transport.requests]
+        self.assertEqual([None, "cursor-1", None], [
+            item["variables"]["after"] for item in requests
+        ])
+        self.assertEqual([100, 100, 1], [
+            item["variables"]["first"] for item in requests
+        ])
+        self.assertIn("LABELED_EVENT", requests[0]["query"])
+        self.assertIn("UNLABELED_EVENT", requests[0]["query"])
+
+    def test_label_timeline_preserves_all_actor_types_and_null(self):
+        actor_cases = (
+            ("Bot", "B_bot", 101, "app[bot]"),
+            ("Mannequin", "M_imported", 102, "imported"),
+            ("Organization", "O_org", 103, "example-org"),
+            ("EnterpriseUserAccount", "E_enterprise", None, "enterprise-user"),
+            ("User", "U_user", 104, "approver"),
+            ("User", "U_ghost", 10137, "ghost"),
+            (None, None, None, None),
+        )
+        for index, (actor_type, node_id, database_id, login) in enumerate(actor_cases):
+            with self.subTest(actor_type=actor_type, login=login):
+                edge = self.label_timeline_event(
+                    f"LE_{index}",
+                    f"cursor-{index}",
+                    actor_type=actor_type,
+                    actor_node_id=node_id,
+                    actor_database_id=database_id,
+                    actor_login=login,
+                )
+                response = self.label_timeline_response(
+                    [edge], total_count=1, end_cursor=edge["cursor"]
+                )
+                client = self.make_client(
+                    [
+                        response,
+                        self.label_timeline_response(
+                            [edge], total_count=1, end_cursor=edge["cursor"]
+                        ),
+                    ]
+                )
+                event = client.list_pull_request_label_timeline(
+                    REPOSITORY, 7
+                ).events[0]
+                self.assertEqual(actor_type, event.actor_type)
+                self.assertEqual(node_id, event.actor_node_id)
+                self.assertEqual(database_id, event.actor_database_id)
+                self.assertEqual(login, event.actor_login)
+
+    def test_label_timeline_rejects_cursor_and_event_repetition(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        duplicates = (
+            self.label_timeline_event(
+                "LE_1", "cursor-2", created_at="2026-07-25T01:02:04Z"
+            ),
+            self.label_timeline_event(
+                "LE_2", "cursor-1", created_at="2026-07-25T01:02:04Z"
+            ),
+        )
+        for duplicate in duplicates:
+            with self.subTest(duplicate=duplicate):
+                client = self.make_client(
+                    [
+                        self.label_timeline_response(
+                            [first],
+                            total_count=2,
+                            has_next_page=True,
+                            end_cursor="cursor-1",
+                        ),
+                        self.label_timeline_response(
+                            [duplicate],
+                            total_count=2,
+                            end_cursor=duplicate["cursor"],
+                        ),
+                    ]
+                )
+                with self.assertRaisesRegex(GitHubAPIError, "repeated"):
+                    client.list_pull_request_label_timeline(REPOSITORY, 7)
+
+    def test_label_timeline_rejects_snapshot_change_and_backwards_order(self):
+        first = self.label_timeline_event(
+            "LE_1", "cursor-1", created_at="2026-07-25T01:02:04Z"
+        )
+        second = self.label_timeline_event(
+            "LE_2", "cursor-2", created_at="2026-07-25T01:02:03Z"
+        )
+        cases = (
+            [
+                self.label_timeline_response(
+                    [first],
+                    total_count=2,
+                    has_next_page=True,
+                    end_cursor="cursor-1",
+                ),
+                self.label_timeline_response(
+                    [second],
+                    total_count=2,
+                    updated_at="2026-07-25T01:04:00Z",
+                    end_cursor="cursor-2",
+                ),
+            ],
+            [
+                self.label_timeline_response(
+                    [first],
+                    total_count=2,
+                    has_next_page=True,
+                    end_cursor="cursor-1",
+                ),
+                self.label_timeline_response(
+                    [second], total_count=2, end_cursor="cursor-2"
+                ),
+            ],
+        )
+        for responses in cases:
+            with self.subTest(responses=responses):
+                client = self.make_client(responses)
+                with self.assertRaises(GitHubAPIError):
+                    client.list_pull_request_label_timeline(REPOSITORY, 7)
+
+    def test_label_timeline_rejects_watermark_change(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        client = self.make_client(
+            [
+                self.label_timeline_response(
+                    [first], total_count=1, end_cursor="cursor-1"
+                ),
+                self.label_timeline_response(
+                    [first],
+                    total_count=2,
+                    updated_at="2026-07-25T01:04:00Z",
+                    has_next_page=True,
+                    end_cursor="cursor-1",
+                ),
+            ]
+        )
+        with self.assertRaisesRegex(GitHubAPIError, "verification completed"):
+            client.list_pull_request_label_timeline(REPOSITORY, 7)
+
+    def test_remove_label_url_encodes_name_and_validates_response(self):
+        client = self.make_client(
+            [
+                FakeResponse(
+                    [
+                        {
+                            "id": 1,
+                            "node_id": "LA_remaining",
+                            "name": "remaining",
+                        }
+                    ]
+                )
+            ]
+        )
+
+        result = client.remove_label(REPOSITORY, 7, "merge approved/now")
+
+        self.assertEqual("remaining", result[0]["name"])
+        api_request = self.transport.requests[0]
+        self.assertEqual("DELETE", api_request.method)
+        self.assertTrue(api_request.full_url.endswith(
+            "/issues/7/labels/merge%20approved%2Fnow"
+        ))
+
+    def test_remove_label_404_and_timeout_are_not_success(self):
+        failures = (
+            FakeResponse({"message": "not found"}, status=404),
+            error.URLError("timed out"),
+        )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                client = self.make_client([failure])
+                with self.assertRaises(GitHubAPIError):
+                    client.remove_label(REPOSITORY, 7, "hermes:merge-approved")
+                self.assertEqual(1, len(self.transport.requests))
 
     @staticmethod
     def review_threads_response(nodes, has_next_page=False, end_cursor=None):
