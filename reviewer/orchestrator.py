@@ -9,16 +9,19 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+import uuid
 
 from fastapi import FastAPI, HTTPException, Request, Response
 
+from reviewer.approval_runtime import ApprovalRuntime
 from reviewer.config import Settings
 from reviewer.decision import (
     ci_satisfies_policy,
     decision_summary,
-    find_existing_review,
+    find_review_context_review,
     format_review,
     has_blocking_human_review,
+    review_context_marker,
 )
 from reviewer.discord_reporter import DiscordReporter
 from reviewer.github_auth import GitHubAppAuth
@@ -26,6 +29,7 @@ from reviewer.github_client import GitHubClient
 from reviewer.models import ReviewJob, ReviewState, WebhookEvent
 from reviewer.policy import Eligibility, RepositoryPolicy, load_policies
 from reviewer.review_schema import ReviewDecision, ReviewResult
+from reviewer.review_publisher import ReviewPublishUnknown
 from reviewer.spool import read_json, write_bytes_atomic, write_json_atomic
 from reviewer.state import StateStore
 from reviewer.webhook import (
@@ -46,6 +50,7 @@ WEBHOOK_SLOTS = asyncio.Semaphore(WEBHOOK_CONCURRENCY)
 CHANGES_REQUESTED_LABEL = "hermes:changes-requested"
 POLICY_REPORT_PATH_LIMIT = 5
 POLICY_REPORT_PATH_CHARS = 120
+MAX_REVIEW_BODY_CHARS = 60_000
 
 
 class ReviewerRuntime:
@@ -73,26 +78,49 @@ class ReviewerRuntime:
             github = GitHubClient(auth)
         self.github = github
         self.reporter = reporter or DiscordReporter(settings.discord_webhook_url)
+        self.approval_runtime = ApprovalRuntime(
+            self.store,
+            self.github,
+            self.reporter,
+            app_actor=f"{settings.app_slug}[bot]",
+            approver_ids=settings.approver_ids,
+            approval_label=settings.approval_label,
+        )
         self._stop = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
         self._reconciler: asyncio.Task[None] | None = None
         self._bootstrapper: asyncio.Task[None] | None = None
+        self._approval_outbox_sender: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         self.store.recover_after_restart()
         self._worker = asyncio.create_task(self._worker_loop(), name="review-worker")
         self._reconciler = asyncio.create_task(self._reconcile_loop(), name="review-reconciler")
         self._bootstrapper = asyncio.create_task(self._bootstrap_open_pulls(), name="review-bootstrap")
+        self._approval_outbox_sender = asyncio.create_task(
+            self._approval_outbox_loop(),
+            name="approval-outbox",
+        )
 
     async def stop(self) -> None:
         self._stop.set()
-        tasks = [task for task in (self._worker, self._reconciler, self._bootstrapper) if task is not None]
+        tasks = [
+            task
+            for task in (
+                self._worker,
+                self._reconciler,
+                self._bootstrapper,
+                self._approval_outbox_sender,
+            )
+            if task is not None
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self.store.close()
 
     async def _bootstrap_open_pulls(self) -> None:
+        bootstrap_run_id = uuid.uuid4().hex
         for repository in self.settings.repositories:
             if self._stop.is_set():
                 return
@@ -104,13 +132,23 @@ class ReviewerRuntime:
                     number = pull.get("number")
                     head_sha = str(((pull.get("head") or {}).get("sha") or "")).lower()
                     base_sha = str(((pull.get("base") or {}).get("sha") or "")).lower()
-                    if not isinstance(number, int) or len(head_sha) != 40 or len(base_sha) != 40:
+                    repository_id = _pull_base_repository_id(pull)
+                    if (
+                        not isinstance(number, int)
+                        or len(head_sha) != 40
+                        or len(base_sha) != 40
+                        or repository_id is None
+                    ):
                         continue
                     event = WebhookEvent(
-                        delivery_id=f"bootstrap:{repository}:{number}:{head_sha}",
+                        delivery_id=(
+                            f"bootstrap:{bootstrap_run_id}:{repository_id}:"
+                            f"{repository}:{number}:"
+                            f"{base_sha}:{head_sha}"
+                        ),
                         event_name="pull_request",
-                        action="opened",
-                        repository_id=None,
+                        action="bootstrap_reconcile",
+                        repository_id=repository_id,
                         repository=repository,
                         installation_id=None,
                         pull_number=number,
@@ -123,6 +161,59 @@ class ReviewerRuntime:
                     await asyncio.to_thread(self.store.ingest, event)
             except Exception:
                 LOGGER.exception("open pull bootstrap failed for %s", repository)
+
+    async def _approval_outbox_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                row = await asyncio.to_thread(
+                    self.store.claim_next_approval_outbox
+                )
+            except Exception:
+                LOGGER.exception("approval outbox claim failed")
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=2)
+                except TimeoutError:
+                    pass
+                continue
+            if row is None:
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=2)
+                except TimeoutError:
+                    pass
+                continue
+            try:
+                await asyncio.to_thread(
+                    self.approval_runtime.deliver_outbox_row,
+                    row,
+                )
+            except Exception as exc:
+                LOGGER.exception("approval outbox %s failed", row["id"])
+                try:
+                    await asyncio.to_thread(
+                        self.store.retry_approval_outbox,
+                        row["id"],
+                        f"{type(exc).__name__}: {exc}",
+                        claimed_at=row["claimed_at"],
+                        attempt_count=row["attempt_count"],
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "could not persist approval outbox %s retry",
+                        row["id"],
+                    )
+            else:
+                try:
+                    await asyncio.to_thread(
+                        self.store.complete_approval_outbox,
+                        row["id"],
+                        claimed_at=row["claimed_at"],
+                        attempt_count=row["attempt_count"],
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "could not persist approval outbox %s completion",
+                        row["id"],
+                    )
 
     async def _worker_loop(self) -> None:
         while not self._stop.is_set():
@@ -141,7 +232,15 @@ class ReviewerRuntime:
             except Exception as exc:
                 LOGGER.exception("review job %s failed", job.id)
                 try:
-                    if job.attempt_count < 3:
+                    if isinstance(exc, ReviewPublishUnknown):
+                        await asyncio.to_thread(
+                            self.store.transition,
+                            job.id,
+                            ReviewState.HUMAN_REVIEW,
+                            expected=ReviewState.REVIEWING,
+                            last_error=f"{type(exc).__name__}: {exc}"[:2_000],
+                        )
+                    elif job.attempt_count < 3:
                         retry_at = (
                             datetime.now(timezone.utc) + timedelta(minutes=2 ** job.attempt_count)
                         ).isoformat(timespec="seconds")
@@ -159,7 +258,13 @@ class ReviewerRuntime:
                         )
                 except Exception:
                     LOGGER.exception("could not persist failure for job %s", job.id)
-                event = "검토 재시도 예약" if job.attempt_count < 3 else "검토 실패"
+                event = (
+                    "검토 게시 상태 확인 필요"
+                    if isinstance(exc, ReviewPublishUnknown)
+                    else "검토 재시도 예약"
+                    if job.attempt_count < 3
+                    else "검토 실패"
+                )
                 await self._report(job, event, "자동 검토 중 오류가 발생했습니다. 수동 확인이 필요할 수 있습니다.", pull={})
 
     async def _reconcile_loop(self) -> None:
@@ -200,8 +305,12 @@ class ReviewerRuntime:
             asyncio.to_thread(self.github.get_pull_request, job.repository, job.pull_number),
             asyncio.to_thread(self.github.list_pull_request_files, job.repository, job.pull_number),
         )
-        live_sha = str(((pull.get("head") or {}).get("sha") or "")).lower()
-        if live_sha != job.head_sha.lower():
+        job = await asyncio.to_thread(
+            self._bind_job_repository_identity,
+            job,
+            pull,
+        )
+        if not self._draft_candidate_matches_job(pull, job):
             self.store.transition(job.id, ReviewState.OBSOLETE, expected=ReviewState.REVIEWING)
             return
         if pull.get("state") != "open":
@@ -250,9 +359,21 @@ class ReviewerRuntime:
             asyncio.to_thread(self.github.list_pull_request_files, job.repository, job.pull_number),
             asyncio.to_thread(self.github.get_pull_request_diff, job.repository, job.pull_number),
         )
-        current_sha = str(((current.get("head") or {}).get("sha") or "")).lower()
-        if current_sha != job.head_sha.lower():
+        if not self._draft_candidate_matches_job(current, job):
             self.store.transition(job.id, ReviewState.OBSOLETE, expected=ReviewState.REVIEWING)
+            return
+        if current.get("state") != "open":
+            target = ReviewState.MERGED if current.get("merged") else ReviewState.CLOSED
+            self.store.transition(
+                job.id,
+                target,
+                expected=ReviewState.REVIEWING,
+                merge_sha=(
+                    str(current.get("merge_commit_sha") or "") or None
+                    if target is ReviewState.MERGED
+                    else None
+                ),
+            )
             return
         current_eligibility = policy.evaluate(current, current_files)
         if not current_eligibility.eligible:
@@ -278,6 +399,20 @@ class ReviewerRuntime:
         if test_failed and final_decision is ReviewDecision.PASS:
             final_decision = ReviewDecision.CHANGES_REQUIRED
         body = format_review(result, tests, decision=final_decision, mode=self.settings.mode)
+        if job.base_sha is None:
+            raise RuntimeError("review job has no base SHA")
+        marker = review_context_marker(
+            job.repository,
+            job.repository_id,
+            job.pull_number,
+            job.base_sha,
+            job.head_sha,
+            hashlib.sha256(current_diff.encode("utf-8")).hexdigest(),
+            policy.policy_version,
+            final_decision,
+        )
+        body_lines = body.splitlines()
+        body = (marker + "\n" + "\n".join(body_lines[1:]))[:MAX_REVIEW_BODY_CHARS]
         findings_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
         if self.settings.mode == "observe":
@@ -294,6 +429,14 @@ class ReviewerRuntime:
 
         if final_decision is ReviewDecision.CHANGES_REQUIRED:
             review_event = "COMMENT" if self.settings.mode == "comment" else "REQUEST_CHANGES"
+            if self.settings.mode in {"draft", "auto"}:
+                pre_review = await asyncio.to_thread(
+                    self.github.get_pull_request,
+                    job.repository,
+                    job.pull_number,
+                )
+                if await self._stop_for_changed_review_candidate(job, pre_review):
+                    return
             review = await self._create_review_once(
                 job,
                 body=body,
@@ -305,24 +448,11 @@ class ReviewerRuntime:
                     job.repository,
                     job.pull_number,
                 )
-                if not self._draft_candidate_matches_job(pre_label, job):
-                    self.store.transition(
-                        job.id,
-                        ReviewState.OBSOLETE,
-                        expected=ReviewState.REVIEWING,
-                    )
-                    return
-                if pre_label.get("state") != "open":
-                    target = (
-                        ReviewState.MERGED
-                        if pre_label.get("merged")
-                        else ReviewState.CLOSED
-                    )
-                    self.store.transition(
-                        job.id,
-                        target,
-                        expected=ReviewState.REVIEWING,
-                    )
+                if await self._stop_for_changed_review_candidate(
+                    job,
+                    pre_label,
+                    blocking_review=review,
+                ):
                     return
                 labels = await asyncio.to_thread(
                     self.github.add_labels,
@@ -343,24 +473,11 @@ class ReviewerRuntime:
                     job.repository,
                     job.pull_number,
                 )
-                if not self._draft_candidate_matches_job(pre_convert, job):
-                    self.store.transition(
-                        job.id,
-                        ReviewState.OBSOLETE,
-                        expected=ReviewState.REVIEWING,
-                    )
-                    return
-                if pre_convert.get("state") != "open":
-                    target = (
-                        ReviewState.MERGED
-                        if pre_convert.get("merged")
-                        else ReviewState.CLOSED
-                    )
-                    self.store.transition(
-                        job.id,
-                        target,
-                        expected=ReviewState.REVIEWING,
-                    )
+                if await self._stop_for_changed_review_candidate(
+                    job,
+                    pre_convert,
+                    blocking_review=review,
+                ):
                     return
                 if pre_convert.get("draft") is True:
                     self._transition_after_draft_confirmation(
@@ -388,24 +505,11 @@ class ReviewerRuntime:
                     job.repository,
                     job.pull_number,
                 )
-                if not self._draft_candidate_matches_job(confirmed_draft, job):
-                    self.store.transition(
-                        job.id,
-                        ReviewState.OBSOLETE,
-                        expected=ReviewState.REVIEWING,
-                    )
-                    return
-                if confirmed_draft.get("state") != "open":
-                    target = (
-                        ReviewState.MERGED
-                        if confirmed_draft.get("merged")
-                        else ReviewState.CLOSED
-                    )
-                    self.store.transition(
-                        job.id,
-                        target,
-                        expected=ReviewState.REVIEWING,
-                    )
+                if await self._stop_for_changed_review_candidate(
+                    job,
+                    confirmed_draft,
+                    blocking_review=review,
+                ):
                     return
                 if confirmed_draft.get("draft") is not True:
                     raise RuntimeError(
@@ -433,7 +537,7 @@ class ReviewerRuntime:
             await self._report(job, "수정 필요", result.summary, pull=current)
             return
 
-        if final_decision is ReviewDecision.HUMAN_REVIEW or self.settings.mode in {"comment", "draft"}:
+        if final_decision is ReviewDecision.HUMAN_REVIEW or self.settings.mode == "comment":
             review = await self._create_review_once(
                 job,
                 body=body,
@@ -450,27 +554,48 @@ class ReviewerRuntime:
             await self._report(job, "사람 검토 대기", result.summary, pull=current)
             return
 
-        review = await self._create_review_once(
+        publication = await asyncio.to_thread(
+            self.approval_runtime.publish_pass_review,
             job,
+            pull=current,
+            diff=current_diff,
             body=body,
-            event="COMMENT",
-        )
-        reason = "ATOMIC_SERVER_GATES_UNAVAILABLE"
-        self.store.transition(
-            job.id,
-            ReviewState.HUMAN_REVIEW,
-            expected=ReviewState.REVIEWING,
-            review_decision=final_decision.value,
             findings_hash=findings_hash,
-            github_review_id=_optional_id(review),
-            last_error=reason,
+            policy=policy,
         )
+        if publication.job.state is not ReviewState.READY_TO_MERGE:
+            await self._report(
+                job,
+                "검토 context 변경",
+                "PASS review 게시 직후 exact repository/base/head가 변경되어 승인을 차단했습니다.",
+                pull=current,
+            )
+            return
         await self._report(
             job,
-            "병합 중단",
-            "원자적 병합 backend가 아직 검증·활성화되지 않아 자동 병합을 차단했습니다.",
+            "명시적 승인 대기",
+            (
+                f"검토를 통과했습니다. `{self.approval_runtime.approval_label}` "
+                "label을 추가하면 exact review context에 대한 1회 승인으로 처리합니다. "
+                "원자적 병합 backend가 아직 비활성 상태이므로 승인 후에도 자동 병합하지 않습니다."
+            ),
             pull=current,
         )
+
+    async def ingest_webhook(self, event: WebhookEvent) -> None:
+        if (
+            self.settings.mode in {"draft", "auto"}
+            and event.event_name == "pull_request"
+            and event.action in {"labeled", "unlabeled"}
+            and event.label_name == self.approval_runtime.approval_label
+            and event.repository in self.policies
+        ):
+            await asyncio.to_thread(
+                self.approval_runtime.process_label_event,
+                event,
+                policy=self.policies[event.repository],
+            )
+        await asyncio.to_thread(self.store.ingest, event)
 
     def _transition_after_draft_confirmation(
         self,
@@ -515,11 +640,73 @@ class ReviewerRuntime:
         pull: dict[str, Any], job: ReviewJob
     ) -> bool:
         head_sha = str(((pull.get("head") or {}).get("sha") or "")).lower()
-        base_sha = str(((pull.get("base") or {}).get("sha") or "")).lower()
+        base = pull.get("base") or {}
+        base_sha = str((base.get("sha") or "")).lower()
+        base_repo = base.get("repo") or {}
         return (
-            head_sha == job.head_sha.lower()
+            job.repository_id is not None
+            and job.base_sha is not None
+            and base_repo.get("id") == job.repository_id
+            and base_repo.get("full_name") == job.repository
+            and head_sha == job.head_sha.lower()
             and base_sha == job.base_sha.lower()
         )
+
+    def _bind_job_repository_identity(
+        self,
+        job: ReviewJob,
+        pull: dict[str, Any],
+    ) -> ReviewJob:
+        base_repo = ((pull.get("base") or {}).get("repo") or {})
+        repository_id = base_repo.get("id")
+        if (
+            isinstance(repository_id, bool)
+            or not isinstance(repository_id, int)
+            or repository_id <= 0
+            or base_repo.get("full_name") != job.repository
+        ):
+            raise RuntimeError("GitHub pull has no trusted base repository identity")
+        if job.repository_id is not None:
+            if job.repository_id != repository_id:
+                raise RuntimeError("GitHub pull repository identity changed")
+            return job
+        return self.store.bind_job_repository_id(job.id, repository_id)
+
+    async def _stop_for_changed_review_candidate(
+        self,
+        job: ReviewJob,
+        pull: dict[str, Any],
+        *,
+        blocking_review: dict[str, Any] | None = None,
+    ) -> bool:
+        matches = self._draft_candidate_matches_job(pull, job)
+        is_open = pull.get("state") == "open"
+        if matches and is_open:
+            return False
+        if blocking_review is not None:
+            review_id = _optional_id(blocking_review)
+            if review_id is None:
+                raise RuntimeError("blocking review has no trusted ID")
+            await asyncio.to_thread(
+                self.github.dismiss_review,
+                job.repository,
+                job.pull_number,
+                review_id,
+                message="Exact review context changed before Draft enforcement.",
+            )
+        target = (
+            ReviewState.OBSOLETE
+            if not matches
+            else ReviewState.MERGED
+            if pull.get("merged")
+            else ReviewState.CLOSED
+        )
+        self.store.transition(
+            job.id,
+            target,
+            expected=ReviewState.REVIEWING,
+        )
+        return True
 
     async def _finish_ineligible(
         self,
@@ -579,25 +766,118 @@ class ReviewerRuntime:
 
     async def _create_review_once(self, job: ReviewJob, *, body: str, event: str) -> dict[str, Any]:
         marker = body.splitlines()[0]
+        actor = f"{self.settings.app_slug}[bot]"
         reviews = await asyncio.to_thread(
             self.github.list_pull_request_reviews, job.repository, job.pull_number
         )
-        existing = find_existing_review(
+        superseded_block_ids = []
+        for review in reviews:
+            review_id = _optional_id(review)
+            user = review.get("user") if isinstance(review, dict) else None
+            if (
+                review_id is not None
+                and isinstance(user, dict)
+                and str(user.get("login") or "").casefold() == actor.casefold()
+                and user.get("type") == "Bot"
+                and str(review.get("state") or "").upper() == "CHANGES_REQUESTED"
+                and marker not in str(review.get("body") or "").splitlines()
+            ):
+                superseded_block_ids.append(review_id)
+        trusted = find_review_context_review(
             reviews,
             marker,
             event=event,
-            actor=f"{self.settings.app_slug}[bot]",
+            actor=actor,
+            head_sha=job.head_sha,
         )
-        if existing is not None:
-            return existing
-        return await asyncio.to_thread(
-            self.github.create_review,
-            job.repository,
-            job.pull_number,
-            body=body,
+        if trusted is not None:
+            await asyncio.to_thread(
+                self.store.confirm_review_publication,
+                job_id=job.id,
+                marker=marker,
+                event=event,
+                github_review_id=trusted["id"],
+            )
+        if trusted is None:
+            may_post = await asyncio.to_thread(
+                self.store.begin_review_publication,
+                job_id=job.id,
+                marker=marker,
+                event=event,
+            )
+            if not may_post:
+                reviews = await asyncio.to_thread(
+                    self.github.list_pull_request_reviews,
+                    job.repository,
+                    job.pull_number,
+                )
+                trusted = find_review_context_review(
+                    reviews,
+                    marker,
+                    event=event,
+                    actor=actor,
+                    head_sha=job.head_sha,
+                )
+                if trusted is None:
+                    raise ReviewPublishUnknown()
+                await asyncio.to_thread(
+                    self.store.confirm_review_publication,
+                    job_id=job.id,
+                    marker=marker,
+                    event=event,
+                    github_review_id=trusted["id"],
+                )
+        if trusted is None:
+            try:
+                created = await asyncio.to_thread(
+                    self.github.create_review,
+                    job.repository,
+                    job.pull_number,
+                    body=body,
+                    event=event,
+                    commit_id=job.head_sha,
+                )
+            except Exception as exc:
+                created = None
+            trusted = find_review_context_review(
+                [created] if isinstance(created, dict) else [],
+                marker,
+                event=event,
+                actor=actor,
+                head_sha=job.head_sha,
+            )
+        if trusted is None:
+            reviews = await asyncio.to_thread(
+                self.github.list_pull_request_reviews,
+                job.repository,
+                job.pull_number,
+            )
+            trusted = find_review_context_review(
+                reviews,
+                marker,
+                event=event,
+                actor=actor,
+                head_sha=job.head_sha,
+            )
+        if trusted is None:
+            raise ReviewPublishUnknown()
+        await asyncio.to_thread(
+            self.store.confirm_review_publication,
+            job_id=job.id,
+            marker=marker,
             event=event,
-            commit_id=job.head_sha,
+            github_review_id=trusted["id"],
         )
+        if event == "REQUEST_CHANGES":
+            for review_id in superseded_block_ids:
+                await asyncio.to_thread(
+                    self.github.dismiss_review,
+                    job.repository,
+                    job.pull_number,
+                    review_id,
+                    message="Superseded by a new exact review context.",
+                )
+        return trusted
 
     async def _final_merge_gate(
         self,
@@ -694,6 +974,15 @@ class ReviewerRuntime:
 def _optional_id(payload: dict[str, Any]) -> int | None:
     value = payload.get("id")
     return value if isinstance(value, int) else None
+
+
+def _pull_base_repository_id(pull: dict[str, Any]) -> int | None:
+    value = (((pull.get("base") or {}).get("repo") or {}).get("id"))
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        else None
+    )
 
 
 def _policy_exclusion_summary(
@@ -829,7 +1118,7 @@ async def github_webhook(request: Request) -> Response:
             raise HTTPException(status_code=400, detail="invalid payload") from exc
         if event.repository and event.repository not in runtime.settings.repositories:
             return Response(status_code=202)
-        await asyncio.to_thread(runtime.store.ingest, event)
+        await runtime.ingest_webhook(event)
         return Response(status_code=202)
     finally:
         WEBHOOK_SLOTS.release()

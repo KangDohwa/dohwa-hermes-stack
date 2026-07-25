@@ -18,6 +18,18 @@ _REVIEW_ATTEMPT_MARKER = re.compile(
     r"schema=2 -->$"
 )
 _REVIEW_ATTEMPT_MARKER_PREFIX = "<!-- dohwa-bot-review repo="
+_REVIEW_CONTEXT_MARKER = re.compile(
+    r"^<!-- dohwa-bot-review "
+    r"repo=(?P<repository>[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}) "
+    r"repo_id=(?P<repository_id>[1-9][0-9]*) "
+    r"pr=(?P<pull_number>[1-9][0-9]*) "
+    r"base=(?P<base_sha>[0-9a-f]{40}) "
+    r"head=(?P<head_sha>[0-9a-f]{40}) "
+    r"diff=(?P<diff_sha256>[0-9a-f]{64}) "
+    r"policy=(?P<policy_version>[A-Za-z0-9._-]{1,64}) "
+    r"decision=(?P<decision>pass|changes_required|human_review) "
+    r"schema=3 -->$"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +38,18 @@ class ReviewAttemptMarker:
     pull_number: int
     head_sha: str
     review_attempt_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewContextMarker:
+    repository: str
+    repository_id: int
+    pull_number: int
+    base_sha: str
+    head_sha: str
+    diff_sha256: str
+    policy_version: str
+    decision: ReviewDecision
 
 
 def review_marker(head_sha: str, decision: ReviewDecision) -> str:
@@ -45,6 +69,27 @@ def review_attempt_marker(
     parsed = parse_review_attempt_marker(marker)
     if parsed is None:
         raise ValueError("review attempt marker fields are not canonical")
+    return marker
+
+
+def review_context_marker(
+    repository: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_sha: str,
+    diff_sha256: str,
+    policy_version: str,
+    decision: ReviewDecision,
+) -> str:
+    marker = (
+        f"<!-- dohwa-bot-review repo={repository} repo_id={repository_id} "
+        f"pr={pull_number} "
+        f"base={base_sha} head={head_sha} diff={diff_sha256} "
+        f"policy={policy_version} decision={decision.value} schema=3 -->"
+    )
+    if parse_review_context_marker(marker) is None:
+        raise ValueError("review context marker fields are not canonical")
     return marker
 
 
@@ -70,6 +115,28 @@ def parse_review_attempt_marker(value: str) -> ReviewAttemptMarker | None:
     )
 
 
+def parse_review_context_marker(value: str) -> ReviewContextMarker | None:
+    if not isinstance(value, str):
+        return None
+    match = _REVIEW_CONTEXT_MARKER.fullmatch(value)
+    if match is None:
+        return None
+    pull_number = int(match.group("pull_number"))
+    repository_id = int(match.group("repository_id"))
+    if pull_number > 2**63 - 1 or repository_id > 2**63 - 1:
+        return None
+    return ReviewContextMarker(
+        repository=match.group("repository"),
+        repository_id=repository_id,
+        pull_number=pull_number,
+        base_sha=match.group("base_sha"),
+        head_sha=match.group("head_sha"),
+        diff_sha256=match.group("diff_sha256"),
+        policy_version=match.group("policy_version"),
+        decision=ReviewDecision(match.group("decision")),
+    )
+
+
 def find_review_attempt_review(
     reviews: list[dict[str, Any]],
     marker: str,
@@ -77,15 +144,17 @@ def find_review_attempt_review(
     event: str,
     actor: str,
     head_sha: str,
+    require_attempt_marker: bool = True,
 ) -> dict[str, Any] | None:
-    if parse_review_attempt_marker(marker) is None:
+    if require_attempt_marker and parse_review_attempt_marker(marker) is None:
         raise ValueError("marker must be a canonical schema=2 review marker")
     expected_state = {
         "APPROVE": "APPROVED",
         "COMMENT": "COMMENTED",
+        "REQUEST_CHANGES": "CHANGES_REQUESTED",
     }.get(event.upper())
     if expected_state is None:
-        raise ValueError("pass review event must be APPROVE or COMMENT")
+        raise ValueError("review event is not supported")
     matches: list[dict[str, Any]] = []
     for review in reviews:
         body = review.get("body")
@@ -135,6 +204,26 @@ def find_existing_review(
         ):
             return review
     return None
+
+
+def find_review_context_review(
+    reviews: list[dict[str, Any]],
+    marker: str,
+    *,
+    event: str,
+    actor: str,
+    head_sha: str,
+) -> dict[str, Any] | None:
+    if parse_review_context_marker(marker) is None:
+        raise ValueError("marker must be a canonical schema=3 review marker")
+    return find_review_attempt_review(
+        reviews,
+        marker,
+        event=event,
+        actor=actor,
+        head_sha=head_sha,
+        require_attempt_marker=False,
+    )
 
 
 def ci_satisfies_policy(

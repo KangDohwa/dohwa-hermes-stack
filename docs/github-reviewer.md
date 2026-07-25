@@ -2,7 +2,7 @@
 
 ## Status
 
-The reviewer currently operates in **comment mode**.
+The shipped Compose configuration defaults to **comment mode**.
 
 For an eligible pull request it may:
 
@@ -12,8 +12,23 @@ For an eligible pull request it may:
 - publish a GitHub review comment; and
 - send a private operational summary.
 
-It must not convert a pull request to draft or merge it. A passing review is
-advisory; it is not merge authorization.
+In that default mode it must not convert a pull request to draft or merge it. A
+passing review is advisory; it is not merge authorization.
+
+An operator may explicitly select `draft` mode only after configuring
+`REVIEWER_APPROVER_IDS` with stable numeric GitHub user IDs. In draft mode a
+changes-required result submits a blocking review, applies the
+`hermes:changes-requested` label, and converts the pull request to Draft. A pass
+creates a durable review attempt bound to the exact repository, base, head,
+merge base, diff digest, and policy version. Adding the configured
+`hermes:merge-approved` label is accepted only from the allowlisted user and a
+matching signed webhook plus authoritative GitHub timeline. The label is
+one-time and is removed after processing.
+
+There is no verified atomic merge backend. Even a valid approval is therefore
+terminally invalidated with `ATOMIC_SERVER_GATES_UNAVAILABLE`, reported to the
+operator, and left for human merge. The runtime never falls back to the legacy
+pull-request merge API.
 
 ## Components
 
@@ -84,11 +99,21 @@ high risk and must exercise the human-review path instead.
 5. Analyze the bounded diff and metadata.
 6. Run only allowlisted tests in the isolated executor.
 7. Validate the structured result.
-8. Publish a comment-mode review if the context is still current.
+8. Publish the review action permitted by the explicitly selected mode if the
+   context is still current.
 9. Reconcile later repository events with durable state.
 
 Head, base, or diff changes invalidate the old review context. A previous pass
 must not be carried forward to changed code.
+
+The approval label is a momentary operator signal, not an authorization record.
+Authorization is derived from the signed webhook and authoritative label-event
+timeline, then stored against the exact review context. Removing the consumed
+label is advisory cleanup: GitHub exposes deletion by label name but no
+generation-conditional delete. If an operator removes and re-adds the label at
+the same instant as delayed cleanup, the visible new label can also be removed;
+remove and re-add it once more to retry. This race cannot grant approval or
+carry approval to a different review context.
 
 ## GitHub App and secrets
 
@@ -100,7 +125,8 @@ Provide the following values outside Git:
 - the App identifier and slug;
 - the App private key;
 - the webhook verification secret;
-- the repository allowlist; and
+- the repository allowlist;
+- the numeric GitHub user-ID allowlist when draft mode is enabled; and
 - the private report destination.
 
 Use secret files or an operator-managed secret store. Do not place real values
@@ -115,3 +141,9 @@ commit context, archive integrity, test bounds, or a structured result.
 An unavailable automatic-merge backend does not degrade into a legacy merge
 API call. The current system records the limitation and leaves merge decisions
 to a human.
+
+Review publication uses a durable `MAYBE_SENT` fence before calling GitHub. If
+the response is lost and the exact review cannot be reconciled, the whole pull
+request publication lane is quarantined for human inspection; the reviewer
+does not publish a replacement comment, blocking review, or pass review that
+could later be reversed by the delayed write.

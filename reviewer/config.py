@@ -8,6 +8,7 @@ import re
 
 _APP_SLUG = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?")
 _REPOSITORY_PART = re.compile(r"[A-Za-z0-9_.-]+")
+_APPROVAL_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}")
 
 
 def _required(name: str, environ: dict[str, str]) -> str:
@@ -33,6 +34,20 @@ def _repositories(name: str, raw: str) -> tuple[str, ...]:
     return repositories
 
 
+def _positive_ids(name: str, raw: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for item in raw.split(","):
+        normalized = item.strip()
+        if not normalized:
+            continue
+        if not normalized.isdigit() or int(normalized) <= 0:
+            raise ValueError(f"{name} must contain positive integer IDs")
+        values.append(int(normalized))
+    if len(set(values)) != len(values):
+        raise ValueError(f"{name} must not contain duplicate IDs")
+    return tuple(values)
+
+
 def _read_secret(path: Path, name: str) -> str:
     try:
         value = path.read_text(encoding="utf-8").strip()
@@ -56,6 +71,8 @@ class Settings:
     repositories: tuple[str, ...]
     mode: str = "observe"
     enabled: bool = True
+    approver_ids: tuple[int, ...] = ()
+    approval_label: str = "hermes:merge-approved"
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Settings":
@@ -71,6 +88,19 @@ class Settings:
         mode = (env.get("REVIEWER_MODE") or "observe").strip().lower()
         if mode not in {"observe", "comment", "draft", "auto"}:
             raise ValueError("REVIEWER_MODE must be observe, comment, draft, or auto")
+        approver_ids = _positive_ids(
+            "REVIEWER_APPROVER_IDS",
+            env.get("REVIEWER_APPROVER_IDS") or "",
+        )
+        if mode in {"draft", "auto"} and not approver_ids:
+            raise ValueError(
+                "REVIEWER_APPROVER_IDS is required in draft and auto modes"
+            )
+        approval_label = (
+            env.get("REVIEWER_APPROVAL_LABEL") or "hermes:merge-approved"
+        ).strip()
+        if _APPROVAL_LABEL.fullmatch(approval_label) is None:
+            raise ValueError("REVIEWER_APPROVAL_LABEL must be canonical ASCII")
 
         approved_repositories = _repositories(
             "GITHUB_REPOSITORY_ALLOWLIST",
@@ -115,6 +145,8 @@ class Settings:
             repositories=repositories,
             mode=mode,
             enabled=enabled == "true",
+            approver_ids=approver_ids,
+            approval_label=approval_label,
         )
 
     def webhook_secret(self) -> str:

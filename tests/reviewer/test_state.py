@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 
+from reviewer.approval import ReviewContextContent
 from reviewer.merge_descriptor import CIRequestInputs, MergeDescriptor
 from reviewer.models import (
     CIRequestState,
@@ -23,16 +24,18 @@ def event(
     merged=False,
     merge_sha=None,
     pull_number=7,
+    repository_id=42,
+    base_sha="b" * 40,
 ):
     return WebhookEvent(
         delivery_id=delivery_id,
         event_name="pull_request",
         action=action,
-        repository_id=42,
+        repository_id=repository_id,
         repository="example/example-repo",
         installation_id=99,
         pull_number=pull_number,
-        base_sha="b" * 40,
+        base_sha=base_sha,
         head_sha=head_sha,
         is_draft=draft,
         is_merged=merged,
@@ -119,6 +122,81 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(ready.id, waiting.id)
         self.assertEqual(ready.state, ReviewState.QUEUED)
 
+    def test_repository_id_conflict_is_quarantined_before_state_change(self):
+        waiting = self.store.ingest(event("draft", draft=True)).job
+
+        conflict = self.store.ingest(
+            event(
+                "ready",
+                action="ready_for_review",
+                draft=False,
+                repository_id=777,
+            )
+        )
+
+        self.assertIsNone(conflict.job)
+        persisted = self.store.get_job_by_id(waiting.id)
+        assert persisted is not None
+        self.assertEqual(ReviewState.WAITING_READY, persisted.state)
+        self.assertEqual(42, persisted.repository_id)
+
+    def test_repository_id_conflict_with_new_head_does_not_obsolete_job(self):
+        original = self.store.ingest(event("opened")).job
+
+        conflict = self.store.ingest(
+            event(
+                "synchronize",
+                action="synchronize",
+                head_sha="c" * 40,
+                repository_id=777,
+            )
+        )
+
+        self.assertIsNone(conflict.job)
+        persisted = self.store.get_job_by_id(original.id)
+        assert persisted is not None
+        self.assertEqual(ReviewState.QUEUED, persisted.state)
+        self.assertEqual(42, persisted.repository_id)
+        self.assertEqual([original.id], [job.id for job in self.store.list_jobs()])
+
+    def test_recreated_repository_id_is_quarantined_across_pull_numbers(self):
+        original = self.store.ingest(event("opened", pull_number=10)).job
+
+        conflict = self.store.ingest(
+            event(
+                "recreated-repository",
+                pull_number=11,
+                repository_id=777,
+            )
+        )
+
+        self.assertIsNone(conflict.job)
+        self.assertEqual([original.id], [job.id for job in self.store.list_jobs()])
+
+    def test_same_head_base_change_requeues_exact_context(self):
+        job = self.store.ingest(event("opened")).job
+        assert job is not None
+        reviewing = self.store.transition(
+            job.id,
+            ReviewState.REVIEWING,
+            expected=ReviewState.QUEUED,
+        )
+        self.store.transition(
+            reviewing.id,
+            ReviewState.OBSOLETE,
+            expected=ReviewState.REVIEWING,
+        )
+
+        replacement = self.store.ingest(
+            event("base-changed", action="edited", base_sha="c" * 40)
+        ).job
+
+        assert replacement is not None
+        self.assertEqual(job.id, replacement.id)
+        self.assertEqual("c" * 40, replacement.base_sha)
+        self.assertEqual(ReviewState.QUEUED, replacement.state)
+        self.assertIsNone(replacement.review_decision)
+
     def test_reopened_same_head_is_queued_again(self):
         opened = self.store.ingest(event("opened")).job
         closed = self.store.ingest(event("closed", action="closed")).job
@@ -129,6 +207,153 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(opened.id, reopened.id)
         self.assertEqual(ReviewState.QUEUED, reopened.state)
         self.assertIsNone(reopened.finished_at)
+
+    def test_authoritative_bootstrap_requeues_missed_reopen(self):
+        opened = self.store.ingest(
+            event("bootstrap:first", action="bootstrap_reconcile")
+        ).job
+        self.store.ingest(event("closed", action="closed"))
+
+        recovered = self.store.ingest(
+            event("bootstrap:second", action="bootstrap_reconcile")
+        ).job
+
+        self.assertEqual(opened.id, recovered.id)
+        self.assertEqual(ReviewState.QUEUED, recovered.state)
+        self.assertIsNone(recovered.finished_at)
+
+    def test_authoritative_bootstrap_restores_reopened_draft(self):
+        opened = self.store.ingest(
+            event("bootstrap:first", action="bootstrap_reconcile")
+        ).job
+        self.store.ingest(event("closed", action="closed"))
+
+        recovered = self.store.ingest(
+            event(
+                "bootstrap:second",
+                action="bootstrap_reconcile",
+                draft=True,
+            )
+        ).job
+
+        self.assertEqual(opened.id, recovered.id)
+        self.assertEqual(ReviewState.WAITING_READY, recovered.state)
+        self.assertIsNone(recovered.finished_at)
+
+    def test_review_publication_fence_is_durable_and_idempotent(self):
+        job = self.store.ingest(event("opened")).job
+        marker = "<!-- exact-review-marker -->"
+
+        self.assertTrue(
+            self.store.begin_review_publication(
+                job_id=job.id,
+                marker=marker,
+                event="COMMENT",
+            )
+        )
+        self.assertFalse(
+            self.store.begin_review_publication(
+                job_id=job.id,
+                marker=marker,
+                event="COMMENT",
+            )
+        )
+        self.store.confirm_review_publication(
+            job_id=job.id,
+            marker=marker,
+            event="COMMENT",
+            github_review_id=17,
+        )
+        self.store.confirm_review_publication(
+            job_id=job.id,
+            marker=marker,
+            event="COMMENT",
+            github_review_id=17,
+        )
+        with self.assertRaisesRegex(RuntimeError, "another review"):
+            self.store.confirm_review_publication(
+                job_id=job.id,
+                marker=marker,
+                event="COMMENT",
+                github_review_id=18,
+            )
+
+    def test_unresolved_review_publication_blocks_pr_wide_replacement(self):
+        old = self.store.ingest(event("opened")).job
+        self.assertTrue(
+            self.store.begin_review_publication(
+                job_id=old.id,
+                marker="<!-- old-marker -->",
+                event="REQUEST_CHANGES",
+            )
+        )
+        replacement = self.store.ingest(
+            event("new-head", action="synchronize", head_sha="c" * 40)
+        ).job
+
+        self.assertFalse(
+            self.store.begin_review_publication(
+                job_id=replacement.id,
+                marker="<!-- new-marker -->",
+                event="COMMENT",
+            )
+        )
+        self.assertTrue(
+            self.store.has_unresolved_review_publication(
+                repository_id=42,
+                pull_number=7,
+            )
+        )
+        content = self.store.store_review_context(
+            ReviewContextContent(
+                repository_id=42,
+                pull_number=7,
+                base_sha=replacement.base_sha,
+                head_sha=replacement.head_sha,
+                merge_base_sha="d" * 40,
+                diff_sha256="e" * 64,
+                policy_version="1",
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "generic MAYBE_SENT"):
+            self.store.prepare_review_attempt(
+                job_id=replacement.id,
+                content_id=content.content_id,
+                review_decision="pass",
+            )
+
+    def test_unresolved_pass_publication_blocks_generic_replacement(self):
+        old = self.store.ingest(event("opened")).job
+        content = self.store.store_review_context(
+            ReviewContextContent(
+                repository_id=42,
+                pull_number=7,
+                base_sha=old.base_sha,
+                head_sha=old.head_sha,
+                merge_base_sha="c" * 40,
+                diff_sha256="d" * 64,
+                policy_version="1",
+            )
+        )
+        attempt = self.store.prepare_review_attempt(
+            job_id=old.id,
+            content_id=content.content_id,
+            review_decision="pass",
+        )
+        self.store.mark_review_attempt_publish_maybe_sent(
+            attempt.review_context_id
+        )
+        replacement = self.store.ingest(
+            event("new-head", action="synchronize", head_sha="c" * 40)
+        ).job
+
+        self.assertFalse(
+            self.store.begin_review_publication(
+                job_id=replacement.id,
+                marker="<!-- generic-replacement -->",
+                event="REQUEST_CHANGES",
+            )
+        )
 
     def test_new_head_obsoletes_active_job_and_queues_once(self):
         old = self.store.ingest(event("old")).job

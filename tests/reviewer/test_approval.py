@@ -180,6 +180,20 @@ class ReviewAttemptStateTests(unittest.TestCase):
                 "approval_outbox",
             }.issubset(tables)
         )
+        outbox_columns = {
+            row[1]
+            for row in self.store._connection.execute(
+                "PRAGMA table_info(approval_outbox)"
+            )
+        }
+        self.assertTrue(
+            {
+                "claimed_at",
+                "attempt_count",
+                "last_error",
+                "retry_at",
+            }.issubset(outbox_columns)
+        )
 
         self.store.close()
         with sqlite3.connect(self.db_path) as old_reader:
@@ -590,6 +604,30 @@ class ReviewAttemptStateTests(unittest.TestCase):
         self.assertIn(reviewing.id, report.requeued_job_ids)
         recovered = self.store.get_review_attempt(attempt.review_context_id)
         self.assertEqual(ReviewAttemptStatus.PREPARED, recovered.status)
+
+    def test_same_head_base_change_invalidates_attempt_and_requeues_job(self):
+        attempt = self.store.prepare_review_attempt(
+            job_id=self.job.id,
+            content_id=self.context.content_id,
+            review_decision="pass",
+        )
+
+        replacement = self.store.ingest(
+            replace(
+                pull_event("base-change"),
+                action="edited",
+                base_sha="e" * 40,
+            )
+        ).job
+
+        assert replacement is not None
+        self.assertEqual(self.job.id, replacement.id)
+        self.assertEqual("e" * 40, replacement.base_sha)
+        self.assertEqual(ReviewState.QUEUED, replacement.state)
+        invalidated = self.store.get_review_attempt(attempt.review_context_id)
+        assert invalidated is not None
+        self.assertEqual(ReviewAttemptStatus.INVALIDATED, invalidated.status)
+        self.assertEqual("BASE_CONTEXT_CHANGED", invalidated.invalidation_reason)
 
     def test_maybe_sent_is_durable_and_cannot_be_republished(self):
         attempt = self.store.prepare_review_attempt(
