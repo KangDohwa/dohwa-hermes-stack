@@ -71,6 +71,10 @@ A pull request is not eligible for unattended handling when its repository,
 base branch, fork status, size, mutable state, or high-risk paths fall outside
 the approved policy. The safe result is human review.
 
+Operational canaries should use a harmless documentation-only change. Changes
+to reviewer code, workflows, security policy, or deployment configuration are
+high risk and must exercise the human-review path instead.
+
 ## Review lifecycle
 
 1. Verify and deduplicate the inbound event.
