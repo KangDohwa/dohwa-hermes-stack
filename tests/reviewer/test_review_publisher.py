@@ -11,6 +11,7 @@ from typing import Any
 from reviewer.approval import ReviewAttemptStatus, ReviewContextContent
 from reviewer.decision import review_attempt_marker
 from reviewer.models import ReviewState, WebhookEvent
+from reviewer.review_schema import ReviewDecision
 from reviewer.review_publisher import (
     REVIEW_PUBLISH_UNKNOWN,
     ReviewAttemptPublisher,
@@ -104,12 +105,29 @@ def trusted_review(
     }
 
 
+class PassReviewAttemptPublisher(ReviewAttemptPublisher):
+    def publish(self, job, attempt, *, body, event, decision=ReviewDecision.PASS):
+        return super().publish(
+            job,
+            attempt,
+            body=body,
+            event=event,
+            decision=decision,
+        )
+
+
 class ReviewAttemptPublisherTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temporary_directory.name) / "state.sqlite3"
         self.store = StateStore(self.db_path)
         self.job = self.store.ingest(pull_event()).job
+        self.job = self.store.transition(
+            self.job.id,
+            ReviewState.QUEUED,
+            expected=ReviewState.QUEUED,
+            review_decision="pass",
+        )
         context = self.store.store_review_context(
             ReviewContextContent(
                 repository_id=42,
@@ -124,6 +142,7 @@ class ReviewAttemptPublisherTests(unittest.TestCase):
         self.attempt = self.store.prepare_review_attempt(
             job_id=self.job.id,
             content_id=context.content_id,
+            review_decision="pass",
         )
         self.marker = review_attempt_marker(
             self.job.repository,
@@ -133,7 +152,7 @@ class ReviewAttemptPublisherTests(unittest.TestCase):
         )
         self.body = self.marker + "\nreview passed"
         self.github = FakeGitHub()
-        self.publisher = ReviewAttemptPublisher(
+        self.publisher = PassReviewAttemptPublisher(
             self.store, self.github, app_actor=ACTOR
         )
 
@@ -155,6 +174,23 @@ class ReviewAttemptPublisherTests(unittest.TestCase):
                 self.attempt.review_context_id
             ),
         )
+
+    def test_changes_required_comment_is_rejected_before_github_io(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires a pass decision"):
+            self.publisher.publish(
+                self.job,
+                self.attempt,
+                body=self.body,
+                event="COMMENT",
+                decision=ReviewDecision.CHANGES_REQUIRED,
+            )
+
+        self.assertEqual(0, self.github.list_calls)
+        self.assertEqual(0, self.github.create_calls)
+        current = self.store.get_review_attempt(self.attempt.review_context_id)
+        assert current is not None
+        self.assertEqual(ReviewAttemptStatus.PREPARED, current.status)
+        self.assertEqual("pass", current.review_decision)
 
     def test_timeout_after_remote_write_reconciles_once_and_activates(self) -> None:
         self.github.persist_before_error = True
@@ -215,6 +251,7 @@ class ReviewAttemptPublisherTests(unittest.TestCase):
             self.store.prepare_review_attempt(
                 job_id=self.job.id,
                 content_id=other_context.content_id,
+                review_decision="pass",
             )
 
     def test_restart_with_maybe_sent_only_reconciles_marker(self) -> None:
@@ -224,7 +261,7 @@ class ReviewAttemptPublisherTests(unittest.TestCase):
         self.github.reviews.append(trusted_review(self.body))
         self.store.close()
         self.store = StateStore(self.db_path)
-        publisher = ReviewAttemptPublisher(
+        publisher = PassReviewAttemptPublisher(
             self.store, self.github, app_actor=ACTOR
         )
 
@@ -307,7 +344,7 @@ class ReviewAttemptPublisherTests(unittest.TestCase):
             ).status,
         )
 
-    def test_late_trusted_marker_terminally_confirms_invalidated_attempt(
+    def test_late_marker_after_non_pass_terminal_decision_releases_lane(
         self,
     ) -> None:
         self.store.transition(
@@ -322,6 +359,7 @@ class ReviewAttemptPublisherTests(unittest.TestCase):
             self.job.id,
             ReviewState.HUMAN_REVIEW,
             expected=ReviewState.REVIEWING,
+            review_decision="changes_required",
             last_error="operator review required",
         )
         self.github.reviews.append(trusted_review(self.body, review_id=311))
@@ -363,6 +401,7 @@ class ReviewAttemptPublisherTests(unittest.TestCase):
         replacement = self.store.prepare_review_attempt(
             job_id=self.job.id,
             content_id=replacement_context.content_id,
+            review_decision="pass",
         )
         self.assertEqual(ReviewAttemptStatus.PREPARED, replacement.status)
         self.assertNotEqual(
@@ -498,10 +537,10 @@ class ReviewAttemptPublisherTests(unittest.TestCase):
 
     def test_concurrent_publishers_issue_at_most_one_post(self) -> None:
         other = StateStore(self.db_path)
-        first = ReviewAttemptPublisher(
+        first = PassReviewAttemptPublisher(
             self.store, self.github, app_actor=ACTOR
         )
-        second = ReviewAttemptPublisher(other, self.github, app_actor=ACTOR)
+        second = PassReviewAttemptPublisher(other, self.github, app_actor=ACTOR)
 
         def publish(publisher: ReviewAttemptPublisher) -> object:
             try:

@@ -1124,7 +1124,7 @@ class GitHubClientTests(unittest.TestCase):
                     end_cursor="cursor-1",
                 ),
                 self.label_timeline_response(
-                    [second], total_count=2, end_cursor="cursor-2"
+                    [second], total_count=1, end_cursor="cursor-2"
                 ),
                 self.label_timeline_response(
                     [first],
@@ -1253,6 +1253,80 @@ class GitHubClientTests(unittest.TestCase):
             [100, 1, 100], [item["variables"]["first"] for item in requests]
         )
 
+    def test_tied_label_timestamps_verify_decreasing_counts_across_pages(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        second = self.label_timeline_event("LE_2", "cursor-2")
+        responses = [
+            self.label_timeline_response(
+                [first],
+                total_count=2,
+                has_next_page=True,
+                end_cursor="cursor-1",
+            ),
+            self.label_timeline_response(
+                [second], total_count=1, end_cursor="cursor-2"
+            ),
+            self.label_timeline_response(
+                [first],
+                total_count=2,
+                has_next_page=True,
+                end_cursor="cursor-1",
+            ),
+            self.label_timeline_response(
+                [first],
+                total_count=2,
+                has_next_page=True,
+                end_cursor="cursor-1",
+            ),
+            self.label_timeline_response(
+                [second], total_count=1, end_cursor="cursor-2"
+            ),
+        ]
+        client = self.make_client(responses)
+
+        snapshot = client.list_pull_request_label_timeline(REPOSITORY, 7)
+
+        self.assertEqual(2, snapshot.total_count)
+        self.assertEqual(
+            ["LE_1", "LE_2"], [event.event_id for event in snapshot.events]
+        )
+        requests = [self.request_json(item) for item in self.transport.requests]
+        self.assertEqual(
+            [None, "cursor-1", None, None, "cursor-1"],
+            [item["variables"]["after"] for item in requests],
+        )
+        self.assertEqual(
+            [100, 100, 1, 100, 100],
+            [item["variables"]["first"] for item in requests],
+        )
+
+    def test_label_timeline_rejects_incorrect_remaining_count(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        second = self.label_timeline_event(
+            "UE_2",
+            "cursor-2",
+            typename="UnlabeledEvent",
+            created_at="2026-07-25T01:02:04Z",
+        )
+        client = self.make_client(
+            [
+                self.label_timeline_response(
+                    [first],
+                    total_count=2,
+                    has_next_page=True,
+                    end_cursor="cursor-1",
+                ),
+                self.label_timeline_response(
+                    [second], total_count=2, end_cursor="cursor-2"
+                ),
+            ]
+        )
+
+        with self.assertRaisesRegex(GitHubAPIError, "count changed") as raised:
+            client.list_pull_request_label_timeline(REPOSITORY, 7)
+
+        self.assertEqual("LABEL_TIMELINE_DISCONTINUITY", raised.exception.code)
+
     def test_tied_label_timestamp_sequence_change_is_discontinuity(self):
         first = self.label_timeline_event("LE_1", "cursor-1")
         second = self.label_timeline_event("LE_2", "cursor-2")
@@ -1336,7 +1410,7 @@ class GitHubClientTests(unittest.TestCase):
                         ),
                         self.label_timeline_response(
                             [duplicate],
-                            total_count=2,
+                            total_count=1,
                             end_cursor=duplicate["cursor"],
                         ),
                     ]
@@ -1361,7 +1435,7 @@ class GitHubClientTests(unittest.TestCase):
                 ),
                 self.label_timeline_response(
                     [second],
-                    total_count=2,
+                    total_count=1,
                     updated_at="2026-07-25T01:04:00Z",
                     end_cursor="cursor-2",
                 ),
@@ -1374,7 +1448,7 @@ class GitHubClientTests(unittest.TestCase):
                     end_cursor="cursor-1",
                 ),
                 self.label_timeline_response(
-                    [second], total_count=2, end_cursor="cursor-2"
+                    [second], total_count=1, end_cursor="cursor-2"
                 ),
             ],
         )

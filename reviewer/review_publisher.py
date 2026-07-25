@@ -3,13 +3,18 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol
 
-from reviewer.approval import ReviewAttempt, ReviewAttemptStatus
+from reviewer.approval import (
+    APPROVAL_REVIEW_DECISION,
+    ReviewAttempt,
+    ReviewAttemptStatus,
+)
 from reviewer.decision import (
     find_review_attempt_review,
     parse_review_attempt_marker,
     review_attempt_marker,
 )
 from reviewer.models import ReviewJob
+from reviewer.review_schema import ReviewDecision
 from reviewer.state import StateStore
 
 
@@ -65,7 +70,12 @@ class ReviewAttemptPublisher:
         *,
         body: str,
         event: str,
+        decision: ReviewDecision,
     ) -> ReviewAttempt:
+        if decision is not ReviewDecision.PASS:
+            raise ValueError("approval-capable review attempt requires a pass decision")
+        if attempt.review_decision != APPROVAL_REVIEW_DECISION:
+            raise ValueError("review attempt is not bound to a pass decision")
         normalized_event = _pass_review_event(event)
         marker = _validate_identity(job, attempt, body)
         current = self._load_current(
@@ -178,6 +188,7 @@ class ReviewAttemptPublisher:
             or current.job_id != attempt.job_id
             or current.job_id != job.id
             or current.content_id != attempt.content_id
+            or current.review_decision != attempt.review_decision
         ):
             raise ValueError("review attempt identity does not match review job")
         if current.status is ReviewAttemptStatus.INVALIDATED:
@@ -194,6 +205,8 @@ class ReviewAttemptPublisher:
             ReviewAttemptStatus.ACTIVE,
         }:
             raise RuntimeError("review attempt is terminal")
+        elif current_job.review_decision != APPROVAL_REVIEW_DECISION:
+            raise ValueError("review job decision is not pass")
 
         context = self._store.get_review_context(current.content_id)
         if context is None:

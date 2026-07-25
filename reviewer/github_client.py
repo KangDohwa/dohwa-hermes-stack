@@ -1027,9 +1027,23 @@ class GitHubClient:
             if identity is None:
                 identity = page_identity
                 timeline_identity = page_timeline
-            elif identity != page_identity or timeline_identity != page_timeline:
+            elif (
+                identity != page_identity
+                or timeline_identity is None
+                or timeline_identity[0] != page_timeline[0]
+            ):
                 self._label_timeline_error(
                     "GitHub label timeline changed during pagination"
+                )
+            assert timeline_identity is not None
+            expected_remaining = timeline_identity[1] - len(events)
+            if (
+                expected_remaining < 0
+                or page_timeline[1] != expected_remaining
+                or len(edges) > expected_remaining
+            ):
+                self._label_timeline_error(
+                    "GitHub label timeline count changed during pagination"
                 )
 
             if cursor is not None and not edges:
@@ -1188,9 +1202,22 @@ class GitHubClient:
                     data, canonical=canonical, pull_number=pull_number
                 )
             )
-            if page_identity != identity or page_timeline != timeline_identity:
+            if (
+                page_identity != identity
+                or page_timeline[0] != timeline_identity[0]
+            ):
                 self._label_timeline_error(
                     "GitHub tied label timeline changed during full verification"
+                )
+            expected_remaining = timeline_identity[1] - event_index
+            if (
+                expected_remaining < 0
+                or page_timeline[1] != expected_remaining
+                or len(edges) > expected_remaining
+            ):
+                self._label_timeline_error(
+                    "GitHub tied label timeline count changed during full "
+                    "verification"
                 )
             if cursor is not None and not edges:
                 self._label_timeline_error(

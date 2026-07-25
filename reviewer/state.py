@@ -11,6 +11,7 @@ import sqlite3
 import threading
 
 from reviewer.approval import (
+    APPROVAL_REVIEW_DECISION,
     APPROVAL_SOURCE_VERSION,
     Approval,
     ApprovalSource,
@@ -335,6 +336,8 @@ class StateStore:
                 review_context_id TEXT NOT NULL UNIQUE,
                 job_id INTEGER NOT NULL REFERENCES review_jobs(id),
                 content_id TEXT NOT NULL REFERENCES review_context_contents(content_id),
+                review_decision TEXT NOT NULL
+                    CHECK(review_decision = 'pass'),
                 repository_id INTEGER NOT NULL CHECK(repository_id > 0),
                 pull_number INTEGER NOT NULL CHECK(pull_number > 0),
                 status TEXT NOT NULL CHECK(status IN ('PREPARED', 'ACTIVE', 'INVALIDATED')),
@@ -401,7 +404,8 @@ class StateStore:
             """
             CREATE TRIGGER IF NOT EXISTS review_attempts_identity_no_update
             BEFORE UPDATE OF review_attempt_id, review_context_id, job_id, content_id,
-                repository_id, pull_number, prepared_at ON review_attempts BEGIN
+                review_decision, repository_id, pull_number, prepared_at
+            ON review_attempts BEGIN
                 SELECT RAISE(ABORT, 'review attempt identity is immutable');
             END
             """,
@@ -485,6 +489,12 @@ class StateStore:
             db.execute(
                 "ALTER TABLE review_attempts ADD COLUMN publish_confirmed_at TEXT"
             )
+        if "review_decision" not in columns:
+            db.execute(
+                """
+                ALTER TABLE review_attempts ADD COLUMN review_decision TEXT
+                """
+            )
         db.execute(
             """
             UPDATE review_attempts
@@ -498,6 +508,27 @@ class StateStore:
             WHERE publish_state = 'NOT_SENT'
               AND github_review_id IS NOT NULL
               AND submitted_at IS NOT NULL
+            """
+        )
+        db.execute(
+            """
+            UPDATE review_attempts
+            SET status = 'INVALIDATED',
+                invalidated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                invalidation_reason = 'UNBOUND_LEGACY_REVIEW_DECISION'
+            WHERE status IN ('PREPARED', 'ACTIVE')
+              AND review_decision IS NOT 'pass'
+            """
+        )
+        db.execute("DROP TRIGGER IF EXISTS review_attempts_identity_no_update")
+        db.execute(
+            """
+            CREATE TRIGGER review_attempts_identity_no_update
+            BEFORE UPDATE OF review_attempt_id, review_context_id, job_id, content_id,
+                review_decision, repository_id, pull_number, prepared_at
+            ON review_attempts BEGIN
+                SELECT RAISE(ABORT, 'review attempt identity is immutable');
+            END
             """
         )
         db.execute("DROP TRIGGER IF EXISTS review_attempts_lifecycle_no_direct_update")
@@ -550,6 +581,32 @@ class StateStore:
                 AND {invariant}
             BEGIN
                 SELECT RAISE(ABORT, 'review attempt publish invariant violated');
+            END
+            """
+        )
+        db.execute("DROP TRIGGER IF EXISTS review_attempts_decision_invariant_insert")
+        db.execute("DROP TRIGGER IF EXISTS review_attempts_decision_invariant_update")
+        decision_invariant = """
+            NEW.status IN ('PREPARED', 'ACTIVE')
+                AND NEW.review_decision IS NOT 'pass'
+        """
+        db.execute(
+            f"""
+            CREATE TRIGGER review_attempts_decision_invariant_insert
+            BEFORE INSERT ON review_attempts
+            WHEN {decision_invariant}
+            BEGIN
+                SELECT RAISE(ABORT, 'open review attempt must bind a pass decision');
+            END
+            """
+        )
+        db.execute(
+            f"""
+            CREATE TRIGGER review_attempts_decision_invariant_update
+            BEFORE UPDATE OF status, review_decision ON review_attempts
+            WHEN {decision_invariant}
+            BEGIN
+                SELECT RAISE(ABORT, 'open review attempt must bind a pass decision');
             END
             """
         )
@@ -1265,9 +1322,14 @@ class StateStore:
         *,
         job_id: int,
         content_id: str,
+        review_decision: str,
     ) -> ReviewAttempt:
         if _SHA256.fullmatch(content_id) is None:
             raise ValueError("content_id must be a lowercase SHA-256")
+        if review_decision != APPROVAL_REVIEW_DECISION:
+            raise ValueError(
+                "approval-capable review attempt requires a pass decision"
+            )
         with self._transaction() as db:
             job = db.execute(
                 "SELECT * FROM review_jobs WHERE id = ?", (job_id,)
@@ -1320,14 +1382,16 @@ class StateStore:
                     """
                     INSERT INTO review_attempts(
                         review_attempt_id, review_context_id, job_id, content_id,
-                        repository_id, pull_number, status, prepared_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'PREPARED', ?)
+                        review_decision, repository_id, pull_number, status,
+                        prepared_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?)
                     """,
                     (
                         attempt_id,
                         context_id,
                         job_id,
                         content_id,
+                        review_decision,
                         content["repository_id"],
                         content["pull_number"],
                         prepared_at,
@@ -1423,6 +1487,10 @@ class StateStore:
             if job is None or content is None:
                 raise RuntimeError("review attempt dependencies are missing")
             _validate_review_job_context(job, content)
+            if row["review_decision"] != APPROVAL_REVIEW_DECISION:
+                raise RuntimeError("review attempt is not bound to a pass decision")
+            if job["review_decision"] != APPROVAL_REVIEW_DECISION:
+                raise RuntimeError("review job decision is not pass")
             if row["status"] == ReviewAttemptStatus.ACTIVE.value:
                 if (
                     row["github_review_id"] == github_review_id
@@ -1886,16 +1954,25 @@ class StateStore:
                         else "NO_ACTIVE_REVIEW_ATTEMPT"
                     )
                 else:
-                    content = db.execute(
-                        "SELECT * FROM review_context_contents WHERE content_id = ?",
-                        (attempt["content_id"],),
-                    ).fetchone()
-                    job = db.execute(
-                        "SELECT * FROM review_jobs WHERE id = ?", (attempt["job_id"],)
-                    ).fetchone()
-                    if content is None or job is None:
+                    if attempt["review_decision"] != APPROVAL_REVIEW_DECISION:
+                        reason = "REVIEW_DECISION_NOT_PASS"
+                    else:
+                        content = db.execute(
+                            "SELECT * FROM review_context_contents WHERE content_id = ?",
+                            (attempt["content_id"],),
+                        ).fetchone()
+                        job = db.execute(
+                            "SELECT * FROM review_jobs WHERE id = ?",
+                            (attempt["job_id"],),
+                        ).fetchone()
+                    if reason is None and (content is None or job is None):
                         reason = "REVIEW_CONTEXT_DEPENDENCY_MISSING"
                     elif (
+                        reason is None
+                        and job["review_decision"] != APPROVAL_REVIEW_DECISION
+                    ):
+                        reason = "REVIEW_JOB_DECISION_NOT_PASS"
+                    elif reason is None and (
                         content["repository_id"] != snapshot_repository_id
                         or content["pull_number"] != snapshot_pull_number
                         or content["base_sha"] != webhook.base_sha
@@ -2711,6 +2788,7 @@ def _review_attempt_from_row(row: sqlite3.Row) -> ReviewAttempt:
         review_context_id=row["review_context_id"],
         job_id=row["job_id"],
         content_id=row["content_id"],
+        review_decision=row["review_decision"],
         status=ReviewAttemptStatus(row["status"]),
         github_review_id=row["github_review_id"],
         submitted_at=row["submitted_at"],

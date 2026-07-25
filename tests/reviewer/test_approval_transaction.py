@@ -144,7 +144,9 @@ class ApprovalTransactionTests(unittest.TestCase):
         job = self.store.ingest(pull_opened()).job
         assert job is not None
         self.job_id = job.id
-        self.store.transition(job.id, ReviewState.REVIEWING)
+        self.store.transition(
+            job.id, ReviewState.REVIEWING, review_decision="pass"
+        )
         context = self.store.store_review_context(
             ReviewContextContent(
                 repository_id=REPOSITORY_ID,
@@ -157,7 +159,8 @@ class ApprovalTransactionTests(unittest.TestCase):
             )
         )
         attempt = self.store.prepare_review_attempt(
-            job_id=job.id, content_id=context.content_id
+            job_id=job.id, content_id=context.content_id,
+            review_decision="pass",
         )
         self.store.mark_review_attempt_publish_maybe_sent(
             attempt.review_context_id
@@ -399,7 +402,8 @@ class ApprovalTransactionTests(unittest.TestCase):
             self.attempt.review_context_id, reason="REVIEW_REPLACED"
         )
         prepared = self.store.prepare_review_attempt(
-            job_id=self.job_id, content_id=self.attempt.content_id
+            job_id=self.job_id, content_id=self.attempt.content_id,
+            review_decision="pass",
         )
 
         result = self.process()
@@ -411,6 +415,26 @@ class ApprovalTransactionTests(unittest.TestCase):
         self.assertEqual(
             ReviewState.REVIEWING,
             self.store.get_job_by_id(self.job_id).state,  # type: ignore[union-attr]
+        )
+
+    def test_changes_required_comment_attempt_cannot_enter_approval_lifecycle(self):
+        self.store.transition(
+            self.job_id,
+            ReviewState.REVIEWING,
+            expected=ReviewState.REVIEWING,
+            review_decision="changes_required",
+        )
+
+        result = self.process()
+
+        self.assertEqual("REJECTED", result.outcome)
+        self.assertEqual("REVIEW_JOB_DECISION_NOT_PASS", result.reason)
+        self.assertIsNone(result.approval_id)
+        self.assertEqual(
+            0,
+            self.store._connection.execute(
+                "SELECT count(*) FROM approvals"
+            ).fetchone()[0],
         )
 
     def test_order_only_unlabel_invalidates_exact_generation_then_reapproves(self):

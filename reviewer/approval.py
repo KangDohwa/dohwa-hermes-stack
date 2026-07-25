@@ -18,6 +18,7 @@ REVIEW_CONTEXT_ALGORITHM = "dohwa-bot/review-context-content/v1"
 REVIEW_CONTEXT_DOMAIN = b"dohwa-bot/review-context-content/v1\0"
 REVIEW_CONTEXT_ID_PREFIX = "dohwa-review-context-attempt/v1:"
 APPROVAL_SOURCE_VERSION = "approval-ttl/v1"
+APPROVAL_REVIEW_DECISION = "pass"
 APPROVAL_TTL = timedelta(minutes=10)
 APPROVAL_TTL_SAFETY_MARGIN = timedelta(seconds=30)
 GITHUB_DATE_RESOLUTION = timedelta(seconds=1)
@@ -173,6 +174,7 @@ class ReviewAttempt:
     review_context_id: str
     job_id: int
     content_id: str
+    review_decision: str | None
     status: ReviewAttemptStatus
     github_review_id: int | None
     submitted_at: str | None
