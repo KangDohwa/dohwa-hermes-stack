@@ -160,6 +160,7 @@ class WebhookEvent:
     sender_id: int | None = None
     sender_node_id: str | None = None
     sender_login: str | None = None
+    sender_type: str | None = None
     pull_updated_at: str | None = None
     payload_sha256: str | None = None
 

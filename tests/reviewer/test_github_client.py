@@ -4,7 +4,13 @@ import unittest
 from urllib import error, parse
 
 from reviewer.github_auth import GitHubAuthError
-from reviewer.github_client import GitHubAPIError, GitHubClient, WorkflowIdentity
+from reviewer.github_client import (
+    GitHubAPIError,
+    GitHubClient,
+    GitHubClockObservation,
+    GitHubClockDateStatus,
+    WorkflowIdentity,
+)
 
 
 REPOSITORY = "example/example-repo"
@@ -93,13 +99,14 @@ class FakeClock:
 
 
 class GitHubClientTests(unittest.TestCase):
-    def make_client(self, responses):
+    def make_client(self, responses, **kwargs):
         self.auth = FakeAuth()
         self.transport = RecordingTransport(responses)
         return GitHubClient(
             self.auth,
             urlopen=self.transport,
             redirect_urlopen=self.transport,
+            **kwargs,
         )
 
     @staticmethod
@@ -1117,7 +1124,7 @@ class GitHubClientTests(unittest.TestCase):
                     end_cursor="cursor-1",
                 ),
                 self.label_timeline_response(
-                    [second], total_count=2, end_cursor="cursor-2"
+                    [second], total_count=1, end_cursor="cursor-2"
                 ),
                 self.label_timeline_response(
                     [first],
@@ -1145,6 +1152,202 @@ class GitHubClientTests(unittest.TestCase):
         ])
         self.assertIn("LABELED_EVENT", requests[0]["query"])
         self.assertIn("UNLABELED_EVENT", requests[0]["query"])
+
+    def test_label_timeline_preserves_authenticated_http_date_observation(self):
+        event = self.label_timeline_event("LE_1", "cursor-1")
+        response_date = "Sat, 25 Jul 2026 01:03:00 GMT"
+        responses = [
+            self.label_timeline_response(
+                [event], total_count=1, end_cursor="cursor-1"
+            ),
+            self.label_timeline_response(
+                [event], total_count=1, end_cursor="cursor-1"
+            ),
+        ]
+        for response in responses:
+            response.headers["Date"] = response_date
+        ticks = iter((10.0, 10.25, 20.0, 20.5))
+        client = self.make_client(responses, monotonic=lambda: next(ticks))
+
+        clock = client.list_pull_request_label_timeline(REPOSITORY, 7).clock
+
+        self.assertEqual(GitHubClockDateStatus.VALID, clock.date_status)
+        self.assertEqual(response_date, clock.response_date)
+        self.assertEqual(1784941380, clock.server_date_epoch_seconds)
+        self.assertEqual(20.0, clock.request_started_monotonic)
+        self.assertEqual(20.5, clock.response_received_monotonic)
+        self.assertEqual(0.5, clock.request_rtt_seconds)
+
+    def test_clock_observation_rejects_inconsistent_date_and_epoch(self):
+        with self.assertRaisesRegex(ValueError, "Date and parsed epoch differ"):
+            GitHubClockObservation(
+                response_date="Sat, 25 Jul 2026 01:03:00 GMT",
+                server_date_epoch_seconds=0,
+                request_started_monotonic=1.0,
+                response_received_monotonic=1.5,
+                request_rtt_seconds=0.5,
+                date_status=GitHubClockDateStatus.VALID,
+            )
+
+    def test_label_timeline_clock_identifies_missing_malformed_and_slow_date(self):
+        event = self.label_timeline_event("LE_1", "cursor-1")
+        cases = (
+            (None, (0.0, 0.1, 1.0, 1.1), GitHubClockDateStatus.MISSING, 0.1),
+            (
+                "Sat, 25 Jul 2026 01:03:00 UTC",
+                (0.0, 0.1, 1.0, 1.1),
+                GitHubClockDateStatus.MALFORMED,
+                0.1,
+            ),
+            (
+                "Sat, 25 Jul 2026 01:03:00 GMT",
+                (0.0, 0.1, 1.0, 3.01),
+                GitHubClockDateStatus.VALID,
+                2.01,
+            ),
+        )
+        for response_date, values, expected_status, expected_rtt in cases:
+            with self.subTest(response_date=response_date, expected_rtt=expected_rtt):
+                responses = [
+                    self.label_timeline_response(
+                        [event], total_count=1, end_cursor="cursor-1"
+                    ),
+                    self.label_timeline_response(
+                        [event], total_count=1, end_cursor="cursor-1"
+                    ),
+                ]
+                if response_date is not None:
+                    for response in responses:
+                        response.headers["Date"] = response_date
+                ticks = iter(values)
+                client = self.make_client(responses, monotonic=lambda: next(ticks))
+
+                clock = client.list_pull_request_label_timeline(REPOSITORY, 7).clock
+
+                self.assertEqual(expected_status, clock.date_status)
+                self.assertAlmostEqual(expected_rtt, clock.request_rtt_seconds)
+                if expected_status is not GitHubClockDateStatus.VALID:
+                    self.assertIsNone(clock.server_date_epoch_seconds)
+
+    def test_tied_label_timestamps_require_exact_second_full_traversal(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        second = self.label_timeline_event("LE_2", "cursor-2")
+        initial = self.label_timeline_response(
+            [first, second], total_count=2, end_cursor="cursor-2"
+        )
+        watermark = self.label_timeline_response(
+            [first], total_count=2, has_next_page=True, end_cursor="cursor-1"
+        )
+        verified = self.label_timeline_response(
+            [first, second], total_count=2, end_cursor="cursor-2"
+        )
+        client = self.make_client([initial, watermark, verified])
+
+        snapshot = client.list_pull_request_label_timeline(REPOSITORY, 7)
+
+        self.assertEqual(
+            ["LE_1", "LE_2"], [event.event_id for event in snapshot.events]
+        )
+        requests = [self.request_json(item) for item in self.transport.requests]
+        self.assertEqual(
+            [100, 1, 100], [item["variables"]["first"] for item in requests]
+        )
+
+    def test_tied_label_timestamps_verify_decreasing_counts_across_pages(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        second = self.label_timeline_event("LE_2", "cursor-2")
+        responses = [
+            self.label_timeline_response(
+                [first],
+                total_count=2,
+                has_next_page=True,
+                end_cursor="cursor-1",
+            ),
+            self.label_timeline_response(
+                [second], total_count=1, end_cursor="cursor-2"
+            ),
+            self.label_timeline_response(
+                [first],
+                total_count=2,
+                has_next_page=True,
+                end_cursor="cursor-1",
+            ),
+            self.label_timeline_response(
+                [first],
+                total_count=2,
+                has_next_page=True,
+                end_cursor="cursor-1",
+            ),
+            self.label_timeline_response(
+                [second], total_count=1, end_cursor="cursor-2"
+            ),
+        ]
+        client = self.make_client(responses)
+
+        snapshot = client.list_pull_request_label_timeline(REPOSITORY, 7)
+
+        self.assertEqual(2, snapshot.total_count)
+        self.assertEqual(
+            ["LE_1", "LE_2"], [event.event_id for event in snapshot.events]
+        )
+        requests = [self.request_json(item) for item in self.transport.requests]
+        self.assertEqual(
+            [None, "cursor-1", None, None, "cursor-1"],
+            [item["variables"]["after"] for item in requests],
+        )
+        self.assertEqual(
+            [100, 100, 1, 100, 100],
+            [item["variables"]["first"] for item in requests],
+        )
+
+    def test_label_timeline_rejects_incorrect_remaining_count(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        second = self.label_timeline_event(
+            "UE_2",
+            "cursor-2",
+            typename="UnlabeledEvent",
+            created_at="2026-07-25T01:02:04Z",
+        )
+        client = self.make_client(
+            [
+                self.label_timeline_response(
+                    [first],
+                    total_count=2,
+                    has_next_page=True,
+                    end_cursor="cursor-1",
+                ),
+                self.label_timeline_response(
+                    [second], total_count=2, end_cursor="cursor-2"
+                ),
+            ]
+        )
+
+        with self.assertRaisesRegex(GitHubAPIError, "count changed") as raised:
+            client.list_pull_request_label_timeline(REPOSITORY, 7)
+
+        self.assertEqual("LABEL_TIMELINE_DISCONTINUITY", raised.exception.code)
+
+    def test_tied_label_timestamp_sequence_change_is_discontinuity(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        second = self.label_timeline_event("LE_2", "cursor-2")
+        client = self.make_client(
+            [
+                self.label_timeline_response(
+                    [first, second], total_count=2, end_cursor="cursor-2"
+                ),
+                self.label_timeline_response(
+                    [first], total_count=2, has_next_page=True, end_cursor="cursor-1"
+                ),
+                self.label_timeline_response(
+                    [second, first], total_count=2, end_cursor="cursor-1"
+                ),
+            ]
+        )
+
+        with self.assertRaises(GitHubAPIError) as raised:
+            client.list_pull_request_label_timeline(REPOSITORY, 7)
+
+        self.assertEqual("LABEL_TIMELINE_DISCONTINUITY", raised.exception.code)
 
     def test_label_timeline_preserves_all_actor_types_and_null(self):
         actor_cases = (
@@ -1207,7 +1410,7 @@ class GitHubClientTests(unittest.TestCase):
                         ),
                         self.label_timeline_response(
                             [duplicate],
-                            total_count=2,
+                            total_count=1,
                             end_cursor=duplicate["cursor"],
                         ),
                     ]
@@ -1232,7 +1435,7 @@ class GitHubClientTests(unittest.TestCase):
                 ),
                 self.label_timeline_response(
                     [second],
-                    total_count=2,
+                    total_count=1,
                     updated_at="2026-07-25T01:04:00Z",
                     end_cursor="cursor-2",
                 ),
@@ -1245,7 +1448,7 @@ class GitHubClientTests(unittest.TestCase):
                     end_cursor="cursor-1",
                 ),
                 self.label_timeline_response(
-                    [second], total_count=2, end_cursor="cursor-2"
+                    [second], total_count=1, end_cursor="cursor-2"
                 ),
             ],
         )

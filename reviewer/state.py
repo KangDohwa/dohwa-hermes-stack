@@ -1,14 +1,24 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
 import re
 import sqlite3
 import threading
 
 from reviewer.approval import (
+    APPROVAL_REVIEW_DECISION,
+    APPROVAL_SOURCE_VERSION,
+    Approval,
+    ApprovalSource,
+    ApprovalStatus,
+    LabelEventDisposition,
+    GithubClockObservation,
+    evaluate_approval_ttl,
     REVIEW_CONTEXT_ALGORITHM,
     ReviewAttempt,
     ReviewAttemptStatus,
@@ -34,6 +44,7 @@ from reviewer.models import (
 
 COMPATIBLE_STATE_SCHEMA_VERSION = 1
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_APPROVAL_ATTESTATION_DOMAIN = b"dohwa-bot/approval-attestation/v1\0"
 
 
 class StateStore:
@@ -41,6 +52,7 @@ class StateStore:
         self.path = str(path)
         self._lock = threading.RLock()
         self._review_attempt_write = threading.local()
+        self._approval_write = threading.local()
         self._connection = sqlite3.connect(
             self.path,
             isolation_level=None,
@@ -53,6 +65,11 @@ class StateStore:
             lambda: int(
                 getattr(self._review_attempt_write, "depth", 0) > 0
             ),
+        )
+        self._connection.create_function(
+            "state_store_approval_write_allowed",
+            0,
+            lambda: int(getattr(self._approval_write, "depth", 0) > 0),
         )
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
@@ -90,6 +107,21 @@ class StateStore:
         finally:
             self._review_attempt_write.depth = depth
 
+    @contextmanager
+    def _allow_approval_write(self) -> Iterator[None]:
+        depth = getattr(self._approval_write, "depth", 0)
+        self._approval_write.depth = depth + 1
+        try:
+            yield
+        finally:
+            self._approval_write.depth = depth
+
+    @contextmanager
+    def _approval_transaction(self) -> Iterator[sqlite3.Connection]:
+        with self._allow_approval_write():
+            with self._transaction() as db:
+                yield db
+
     def _migrate(self) -> None:
         with self._transaction() as db:
             self._create_v1_schema(db)
@@ -109,6 +141,9 @@ class StateStore:
                     f"unsupported state schema version: {version}"
                 )
             self._create_phase3_foundation_schema(db)
+            with self._allow_review_attempt_write():
+                self._upgrade_review_attempt_publish_schema(db)
+            self._create_phase3_approval_schema(db)
 
     @staticmethod
     def _create_v1_schema(db: sqlite3.Connection) -> None:
@@ -301,9 +336,15 @@ class StateStore:
                 review_context_id TEXT NOT NULL UNIQUE,
                 job_id INTEGER NOT NULL REFERENCES review_jobs(id),
                 content_id TEXT NOT NULL REFERENCES review_context_contents(content_id),
+                review_decision TEXT NOT NULL
+                    CHECK(review_decision = 'pass'),
                 repository_id INTEGER NOT NULL CHECK(repository_id > 0),
                 pull_number INTEGER NOT NULL CHECK(pull_number > 0),
                 status TEXT NOT NULL CHECK(status IN ('PREPARED', 'ACTIVE', 'INVALIDATED')),
+                publish_state TEXT NOT NULL DEFAULT 'NOT_SENT'
+                    CHECK(publish_state IN ('NOT_SENT', 'MAYBE_SENT', 'CONFIRMED')),
+                publish_started_at TEXT,
+                publish_confirmed_at TEXT,
                 github_review_id INTEGER,
                 submitted_at TEXT,
                 prepared_at TEXT NOT NULL,
@@ -363,14 +404,16 @@ class StateStore:
             """
             CREATE TRIGGER IF NOT EXISTS review_attempts_identity_no_update
             BEFORE UPDATE OF review_attempt_id, review_context_id, job_id, content_id,
-                repository_id, pull_number, prepared_at ON review_attempts BEGIN
+                review_decision, repository_id, pull_number, prepared_at
+            ON review_attempts BEGIN
                 SELECT RAISE(ABORT, 'review attempt identity is immutable');
             END
             """,
             """
             CREATE TRIGGER IF NOT EXISTS review_attempts_lifecycle_no_direct_update
-            BEFORE UPDATE OF status, github_review_id, submitted_at, activated_at,
-                invalidated_at, invalidation_reason ON review_attempts
+            BEFORE UPDATE OF status, publish_state, publish_started_at,
+                publish_confirmed_at, github_review_id, submitted_at,
+                activated_at, invalidated_at, invalidation_reason ON review_attempts
             WHEN state_store_review_attempt_write_allowed() != 1
             BEGIN
                 SELECT RAISE(ABORT, 'review attempt lifecycle is StateStore-managed');
@@ -418,6 +461,416 @@ class StateStore:
             BEFORE DELETE ON ci_requests
             BEGIN
                 SELECT RAISE(ABORT, 'CI requests are immutable');
+            END
+            """,
+        )
+        for statement in statements:
+            db.execute(statement)
+
+    @staticmethod
+    def _upgrade_review_attempt_publish_schema(db: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in db.execute("PRAGMA table_info(review_attempts)").fetchall()
+        }
+        if "publish_state" not in columns:
+            db.execute(
+                """
+                ALTER TABLE review_attempts ADD COLUMN publish_state TEXT NOT NULL
+                    DEFAULT 'NOT_SENT'
+                    CHECK(publish_state IN ('NOT_SENT', 'MAYBE_SENT', 'CONFIRMED'))
+                """
+            )
+        if "publish_started_at" not in columns:
+            db.execute(
+                "ALTER TABLE review_attempts ADD COLUMN publish_started_at TEXT"
+            )
+        if "publish_confirmed_at" not in columns:
+            db.execute(
+                "ALTER TABLE review_attempts ADD COLUMN publish_confirmed_at TEXT"
+            )
+        if "review_decision" not in columns:
+            db.execute(
+                """
+                ALTER TABLE review_attempts ADD COLUMN review_decision TEXT
+                """
+            )
+        db.execute(
+            """
+            UPDATE review_attempts
+            SET publish_state = 'CONFIRMED',
+                publish_started_at = COALESCE(
+                    publish_started_at, activated_at, invalidated_at, prepared_at
+                ),
+                publish_confirmed_at = COALESCE(
+                    publish_confirmed_at, activated_at, invalidated_at, prepared_at
+                )
+            WHERE publish_state = 'NOT_SENT'
+              AND github_review_id IS NOT NULL
+              AND submitted_at IS NOT NULL
+            """
+        )
+        db.execute(
+            """
+            UPDATE review_attempts
+            SET status = 'INVALIDATED',
+                invalidated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                invalidation_reason = 'UNBOUND_LEGACY_REVIEW_DECISION'
+            WHERE status IN ('PREPARED', 'ACTIVE')
+              AND review_decision IS NOT 'pass'
+            """
+        )
+        db.execute("DROP TRIGGER IF EXISTS review_attempts_identity_no_update")
+        db.execute(
+            """
+            CREATE TRIGGER review_attempts_identity_no_update
+            BEFORE UPDATE OF review_attempt_id, review_context_id, job_id, content_id,
+                review_decision, repository_id, pull_number, prepared_at
+            ON review_attempts BEGIN
+                SELECT RAISE(ABORT, 'review attempt identity is immutable');
+            END
+            """
+        )
+        db.execute("DROP TRIGGER IF EXISTS review_attempts_lifecycle_no_direct_update")
+        db.execute(
+            """
+            CREATE TRIGGER review_attempts_lifecycle_no_direct_update
+            BEFORE UPDATE OF status, publish_state, publish_started_at,
+                publish_confirmed_at, github_review_id, submitted_at,
+                activated_at, invalidated_at, invalidation_reason ON review_attempts
+            WHEN state_store_review_attempt_write_allowed() != 1
+            BEGIN
+                SELECT RAISE(ABORT, 'review attempt lifecycle is StateStore-managed');
+            END
+            """
+        )
+        db.execute("DROP TRIGGER IF EXISTS review_attempts_publish_invariant_insert")
+        db.execute("DROP TRIGGER IF EXISTS review_attempts_publish_invariant_update")
+        invariant = """
+            NOT (
+                (NEW.status = 'PREPARED' AND (
+                    (NEW.publish_state = 'NOT_SENT'
+                        AND NEW.publish_started_at IS NULL
+                        AND NEW.publish_confirmed_at IS NULL)
+                    OR (NEW.publish_state = 'MAYBE_SENT'
+                        AND NEW.publish_started_at IS NOT NULL
+                        AND NEW.publish_confirmed_at IS NULL)
+                ))
+                OR (NEW.status = 'ACTIVE'
+                    AND NEW.publish_state = 'CONFIRMED'
+                    AND NEW.publish_started_at IS NOT NULL
+                    AND NEW.publish_confirmed_at IS NOT NULL)
+                OR (NEW.status = 'INVALIDATED' AND (
+                    (NEW.publish_state = 'NOT_SENT'
+                        AND NEW.publish_started_at IS NULL
+                        AND NEW.publish_confirmed_at IS NULL)
+                    OR (NEW.publish_state = 'MAYBE_SENT'
+                        AND NEW.publish_started_at IS NOT NULL
+                        AND NEW.publish_confirmed_at IS NULL)
+                    OR (NEW.publish_state = 'CONFIRMED'
+                        AND NEW.publish_started_at IS NOT NULL
+                        AND NEW.publish_confirmed_at IS NOT NULL)
+                ))
+            )
+        """
+        db.execute(
+            f"""
+            CREATE TRIGGER review_attempts_publish_invariant_insert
+            BEFORE INSERT ON review_attempts
+            WHEN state_store_review_attempt_write_allowed() = 1
+                AND {invariant}
+            BEGIN
+                SELECT RAISE(ABORT, 'review attempt publish invariant violated');
+            END
+            """
+        )
+        db.execute("DROP TRIGGER IF EXISTS review_attempts_decision_invariant_insert")
+        db.execute("DROP TRIGGER IF EXISTS review_attempts_decision_invariant_update")
+        decision_invariant = """
+            NEW.status IN ('PREPARED', 'ACTIVE')
+                AND NEW.review_decision IS NOT 'pass'
+        """
+        db.execute(
+            f"""
+            CREATE TRIGGER review_attempts_decision_invariant_insert
+            BEFORE INSERT ON review_attempts
+            WHEN {decision_invariant}
+            BEGIN
+                SELECT RAISE(ABORT, 'open review attempt must bind a pass decision');
+            END
+            """
+        )
+        db.execute(
+            f"""
+            CREATE TRIGGER review_attempts_decision_invariant_update
+            BEFORE UPDATE OF status, review_decision ON review_attempts
+            WHEN {decision_invariant}
+            BEGIN
+                SELECT RAISE(ABORT, 'open review attempt must bind a pass decision');
+            END
+            """
+        )
+        db.execute(
+            f"""
+            CREATE TRIGGER review_attempts_publish_invariant_update
+            BEFORE UPDATE OF status, publish_state, publish_started_at,
+                publish_confirmed_at ON review_attempts
+            WHEN state_store_review_attempt_write_allowed() = 1
+                AND {invariant}
+            BEGIN
+                SELECT RAISE(ABORT, 'review attempt publish invariant violated');
+            END
+            """
+        )
+
+    @staticmethod
+    def _create_phase3_approval_schema(db: sqlite3.Connection) -> None:
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS github_label_events (
+                event_id TEXT PRIMARY KEY,
+                repository_id INTEGER NOT NULL CHECK(repository_id > 0),
+                repository TEXT NOT NULL,
+                pull_number INTEGER NOT NULL CHECK(pull_number > 0),
+                label_node_id TEXT NOT NULL,
+                label_name TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('LABELED', 'UNLABELED')),
+                actor_type TEXT,
+                actor_github_user_id INTEGER,
+                actor_node_id TEXT,
+                actor_login TEXT,
+                created_at TEXT NOT NULL,
+                ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+                predecessor_event_id TEXT,
+                generation INTEGER NOT NULL CHECK(generation >= 0),
+                disposition TEXT NOT NULL CHECK(disposition IN (
+                    'ORDER_ONLY_NO_APPROVAL', 'SIGNED_APPROVAL_CANDIDATE',
+                    'REJECTED_AMBIGUOUS'
+                )),
+                recorded_at TEXT NOT NULL,
+                UNIQUE(repository_id, pull_number, ordinal)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS github_label_webhook_evidence (
+                delivery_id TEXT PRIMARY KEY,
+                payload_sha256 TEXT NOT NULL
+                    CHECK(length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+                event_id TEXT REFERENCES github_label_events(event_id),
+                review_context_id TEXT REFERENCES review_attempts(review_context_id),
+                repository_id INTEGER,
+                repository TEXT,
+                installation_id INTEGER,
+                pull_number INTEGER,
+                action TEXT,
+                label_id INTEGER,
+                label_node_id TEXT,
+                label_name TEXT,
+                sender_type TEXT,
+                sender_github_user_id INTEGER,
+                sender_node_id TEXT,
+                sender_login TEXT,
+                signed_base_sha TEXT,
+                signed_head_sha TEXT,
+                pull_updated_at TEXT,
+                outcome TEXT NOT NULL CHECK(outcome IN ('ACCEPTED', 'REJECTED')),
+                rejection_reason TEXT,
+                received_at TEXT NOT NULL,
+                CHECK(
+                    (outcome = 'ACCEPTED' AND event_id IS NOT NULL AND rejection_reason IS NULL)
+                    OR (outcome = 'REJECTED' AND rejection_reason IS NOT NULL)
+                )
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_github_label_evidence_event
+                ON github_label_webhook_evidence(event_id)
+                WHERE event_id IS NOT NULL
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS approvals (
+                approval_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL CHECK(source = 'github_label'),
+                source_version TEXT NOT NULL CHECK(source_version = 'approval-ttl/v1'),
+                status TEXT NOT NULL CHECK(status IN ('PENDING', 'ACTIVE', 'CONSUMED', 'INVALIDATED')),
+                repository_id INTEGER NOT NULL CHECK(repository_id > 0),
+                pull_number INTEGER NOT NULL CHECK(pull_number > 0),
+                review_context_id TEXT NOT NULL REFERENCES review_attempts(review_context_id),
+                review_attempt_id TEXT NOT NULL REFERENCES review_attempts(review_attempt_id),
+                content_id TEXT NOT NULL REFERENCES review_context_contents(content_id),
+                label_event_id TEXT NOT NULL UNIQUE REFERENCES github_label_events(event_id),
+                webhook_delivery_id TEXT NOT NULL UNIQUE REFERENCES github_label_webhook_evidence(delivery_id),
+                approver_github_user_id INTEGER NOT NULL CHECK(approver_github_user_id > 0),
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                event_created_at TEXT NOT NULL,
+                accepted_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                attestation_digest TEXT NOT NULL UNIQUE
+                    CHECK(length(attestation_digest) = 64
+                        AND attestation_digest NOT GLOB '*[^0-9a-f]*'),
+                invalidated_at TEXT,
+                invalidation_reason TEXT,
+                CHECK(
+                    (status = 'INVALIDATED' AND invalidated_at IS NOT NULL AND invalidation_reason IS NOT NULL)
+                    OR (status != 'INVALIDATED' AND invalidated_at IS NULL AND invalidation_reason IS NULL)
+                )
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_open_context
+                ON approvals(review_context_id)
+                WHERE status IN ('PENDING', 'ACTIVE')
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS approval_transition_audit (
+                id INTEGER PRIMARY KEY,
+                approval_id TEXT NOT NULL REFERENCES approvals(approval_id),
+                sequence INTEGER NOT NULL CHECK(sequence > 0),
+                from_status TEXT,
+                to_status TEXT NOT NULL,
+                reason TEXT,
+                recorded_at TEXT NOT NULL,
+                UNIQUE(approval_id, sequence)
+            )
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS github_label_events_no_direct_insert
+            BEFORE INSERT ON github_label_events
+            WHEN state_store_approval_write_allowed() != 1 BEGIN
+                SELECT RAISE(ABORT, 'label event insert is StateStore-managed');
+            END
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS approval_outbox (
+                id INTEGER PRIMARY KEY,
+                approval_id TEXT REFERENCES approvals(approval_id),
+                delivery_id TEXT NOT NULL REFERENCES github_label_webhook_evidence(delivery_id),
+                action TEXT NOT NULL CHECK(action IN ('REMOVE_LABEL', 'DISCORD_REPORT')),
+                repository TEXT NOT NULL,
+                pull_number INTEGER NOT NULL CHECK(pull_number > 0),
+                label_name TEXT,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                delivered_at TEXT,
+                UNIQUE(delivery_id, action)
+            )
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS github_label_evidence_no_direct_insert
+            BEFORE INSERT ON github_label_webhook_evidence
+            WHEN state_store_approval_write_allowed() != 1 BEGIN
+                SELECT RAISE(ABORT, 'webhook evidence insert is StateStore-managed');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS github_label_events_no_update
+            BEFORE UPDATE ON github_label_events BEGIN
+                SELECT RAISE(ABORT, 'label event ledger is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_audit_no_direct_insert
+            BEFORE INSERT ON approval_transition_audit
+            WHEN state_store_approval_write_allowed() != 1 BEGIN
+                SELECT RAISE(ABORT, 'approval audit insert is StateStore-managed');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS github_label_events_no_delete
+            BEFORE DELETE ON github_label_events BEGIN
+                SELECT RAISE(ABORT, 'label event ledger is append-only');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_outbox_no_direct_insert
+            BEFORE INSERT ON approval_outbox
+            WHEN state_store_approval_write_allowed() != 1 BEGIN
+                SELECT RAISE(ABORT, 'approval outbox insert is StateStore-managed');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_outbox_no_direct_update
+            BEFORE UPDATE ON approval_outbox
+            WHEN state_store_approval_write_allowed() != 1 BEGIN
+                SELECT RAISE(ABORT, 'approval outbox lifecycle is StateStore-managed');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS github_label_evidence_no_update
+            BEFORE UPDATE ON github_label_webhook_evidence BEGIN
+                SELECT RAISE(ABORT, 'webhook evidence is terminal');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS github_label_evidence_no_delete
+            BEFORE DELETE ON github_label_webhook_evidence BEGIN
+                SELECT RAISE(ABORT, 'webhook evidence is durable');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approvals_no_direct_insert
+            BEFORE INSERT ON approvals
+            WHEN state_store_approval_write_allowed() != 1 BEGIN
+                SELECT RAISE(ABORT, 'approval insert is StateStore-managed');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approvals_identity_no_update
+            BEFORE UPDATE OF approval_id, source, source_version, repository_id,
+                pull_number, review_context_id, review_attempt_id, content_id,
+                label_event_id, webhook_delivery_id, approver_github_user_id,
+                generation, event_created_at, accepted_at, expires_at
+                , attestation_digest
+            ON approvals BEGIN
+                SELECT RAISE(ABORT, 'approval identity is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approvals_no_direct_lifecycle_update
+            BEFORE UPDATE OF status, invalidated_at, invalidation_reason ON approvals
+            WHEN state_store_approval_write_allowed() != 1 BEGIN
+                SELECT RAISE(ABORT, 'approval lifecycle is StateStore-managed');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approvals_transition_guard
+            BEFORE UPDATE OF status ON approvals
+            WHEN NOT (
+                (OLD.status = 'PENDING' AND NEW.status IN ('ACTIVE', 'INVALIDATED'))
+                OR (OLD.status = 'ACTIVE' AND NEW.status IN ('CONSUMED', 'INVALIDATED'))
+            ) BEGIN
+                SELECT RAISE(ABORT, 'invalid approval transition');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approvals_no_delete
+            BEFORE DELETE ON approvals BEGIN
+                SELECT RAISE(ABORT, 'approval is durable');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_audit_no_update
+            BEFORE UPDATE ON approval_transition_audit BEGIN
+                SELECT RAISE(ABORT, 'approval audit is append-only');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_audit_no_delete
+            BEFORE DELETE ON approval_transition_audit BEGIN
+                SELECT RAISE(ABORT, 'approval audit is append-only');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_outbox_identity_no_update
+            BEFORE UPDATE OF id, approval_id, delivery_id, action, repository,
+                pull_number, label_name, payload, created_at ON approval_outbox BEGIN
+                SELECT RAISE(ABORT, 'approval outbox action is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_outbox_no_delete
+            BEFORE DELETE ON approval_outbox BEGIN
+                SELECT RAISE(ABORT, 'approval outbox is durable');
             END
             """,
         )
@@ -869,9 +1322,14 @@ class StateStore:
         *,
         job_id: int,
         content_id: str,
+        review_decision: str,
     ) -> ReviewAttempt:
         if _SHA256.fullmatch(content_id) is None:
             raise ValueError("content_id must be a lowercase SHA-256")
+        if review_decision != APPROVAL_REVIEW_DECISION:
+            raise ValueError(
+                "approval-capable review attempt requires a pass decision"
+            )
         with self._transaction() as db:
             job = db.execute(
                 "SELECT * FROM review_jobs WHERE id = ?", (job_id,)
@@ -902,6 +1360,20 @@ class StateStore:
                 raise RuntimeError(
                     "pull request already has an open review attempt"
                 )
+            unresolved_publish = db.execute(
+                """
+                SELECT review_context_id FROM review_attempts
+                WHERE repository_id = ? AND pull_number = ?
+                  AND publish_state = 'MAYBE_SENT'
+                ORDER BY prepared_at LIMIT 1
+                """,
+                (content["repository_id"], content["pull_number"]),
+            ).fetchone()
+            if unresolved_publish is not None:
+                raise RuntimeError(
+                    "pull request has an unresolved MAYBE_SENT review; "
+                    "reconcile its marker before preparing a replacement"
+                )
             attempt_id = new_uuid7()
             context_id = f"dohwa-review-context-attempt/v1:{attempt_id}"
             prepared_at = _timestamp()
@@ -910,14 +1382,16 @@ class StateStore:
                     """
                     INSERT INTO review_attempts(
                         review_attempt_id, review_context_id, job_id, content_id,
-                        repository_id, pull_number, status, prepared_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'PREPARED', ?)
+                        review_decision, repository_id, pull_number, status,
+                        prepared_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?)
                     """,
                     (
                         attempt_id,
                         context_id,
                         job_id,
                         content_id,
+                        review_decision,
                         content["repository_id"],
                         content["pull_number"],
                         prepared_at,
@@ -936,6 +1410,50 @@ class StateStore:
                 (review_context_id,),
             ).fetchone()
         return _review_attempt_from_row(row) if row else None
+
+    def get_review_attempt_publish_state(self, review_context_id: str) -> str:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT publish_state FROM review_attempts
+                WHERE review_context_id = ?
+                """,
+                (review_context_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown review context: {review_context_id}")
+        return str(row["publish_state"])
+
+    def mark_review_attempt_publish_maybe_sent(
+        self, review_context_id: str
+    ) -> str:
+        now = _timestamp()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM review_attempts WHERE review_context_id = ?",
+                (review_context_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown review context: {review_context_id}")
+            if row["status"] != ReviewAttemptStatus.PREPARED.value:
+                raise RuntimeError("only a prepared review attempt can be published")
+            if row["publish_state"] != "NOT_SENT":
+                raise RuntimeError(
+                    "review publish may already have been sent; reconcile marker instead"
+                )
+            with self._allow_review_attempt_write():
+                updated = db.execute(
+                    """
+                    UPDATE review_attempts
+                    SET publish_state = 'MAYBE_SENT', publish_started_at = ?
+                    WHERE review_context_id = ? AND status = 'PREPARED'
+                      AND publish_state = 'NOT_SENT'
+                    """,
+                    (now, review_context_id),
+                ).rowcount
+            if updated != 1:
+                raise RuntimeError("review publish state CAS failed")
+        return "MAYBE_SENT"
 
     def activate_review_attempt(
         self,
@@ -969,6 +1487,10 @@ class StateStore:
             if job is None or content is None:
                 raise RuntimeError("review attempt dependencies are missing")
             _validate_review_job_context(job, content)
+            if row["review_decision"] != APPROVAL_REVIEW_DECISION:
+                raise RuntimeError("review attempt is not bound to a pass decision")
+            if job["review_decision"] != APPROVAL_REVIEW_DECISION:
+                raise RuntimeError("review job decision is not pass")
             if row["status"] == ReviewAttemptStatus.ACTIVE.value:
                 if (
                     row["github_review_id"] == github_review_id
@@ -978,18 +1500,101 @@ class StateStore:
                 raise RuntimeError("active review attempt is bound to another review")
             if row["status"] != ReviewAttemptStatus.PREPARED.value:
                 raise RuntimeError("review attempt is terminal")
+            if row["publish_state"] != "MAYBE_SENT":
+                raise RuntimeError(
+                    "review publish must be MAYBE_SENT before confirmation"
+                )
             with self._allow_review_attempt_write():
                 updated_count = db.execute(
                     """
                     UPDATE review_attempts
-                    SET status = 'ACTIVE', github_review_id = ?, submitted_at = ?,
-                        activated_at = ?
+                    SET status = 'ACTIVE', publish_state = 'CONFIRMED',
+                        publish_confirmed_at = ?, github_review_id = ?,
+                        submitted_at = ?, activated_at = ?
                     WHERE review_context_id = ? AND status = 'PREPARED'
+                      AND publish_state = 'MAYBE_SENT'
                     """,
-                    (github_review_id, submitted_at, now, review_context_id),
+                    (now, github_review_id, submitted_at, now, review_context_id),
                 ).rowcount
             if updated_count != 1:
                 raise RuntimeError("review attempt activation CAS failed")
+            updated = db.execute(
+                "SELECT * FROM review_attempts WHERE review_context_id = ?",
+                (review_context_id,),
+            ).fetchone()
+        return _review_attempt_from_row(updated)
+
+    def confirm_invalidated_review_attempt_publication(
+        self,
+        review_context_id: str,
+        *,
+        github_review_id: int,
+        submitted_at: str,
+    ) -> ReviewAttempt:
+        if (
+            isinstance(github_review_id, bool)
+            or not isinstance(github_review_id, int)
+            or github_review_id <= 0
+        ):
+            raise ValueError("github_review_id must be a positive integer")
+        _require_github_timestamp(submitted_at, "submitted_at")
+        now = _timestamp()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM review_attempts WHERE review_context_id = ?",
+                (review_context_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown review context: {review_context_id}")
+            if (
+                row["status"] == ReviewAttemptStatus.INVALIDATED.value
+                and row["publish_state"] == "CONFIRMED"
+                and row["github_review_id"] == github_review_id
+                and row["submitted_at"] == submitted_at
+            ):
+                return _review_attempt_from_row(row)
+            if (
+                row["status"] != ReviewAttemptStatus.INVALIDATED.value
+                or row["publish_state"] != "MAYBE_SENT"
+                or row["github_review_id"] is not None
+                or row["submitted_at"] is not None
+            ):
+                raise RuntimeError(
+                    "review attempt is not an invalidated unresolved publication"
+                )
+            job = db.execute(
+                "SELECT * FROM review_jobs WHERE id = ?", (row["job_id"],)
+            ).fetchone()
+            content = db.execute(
+                "SELECT * FROM review_context_contents WHERE content_id = ?",
+                (row["content_id"],),
+            ).fetchone()
+            if job is None or content is None:
+                raise RuntimeError("review attempt dependencies are missing")
+            try:
+                _validate_review_job_context(job, content)
+            except RuntimeError:
+                pass
+            else:
+                raise RuntimeError(
+                    "review context remains valid; terminal attribution is forbidden"
+                )
+            with self._allow_review_attempt_write():
+                updated_count = db.execute(
+                    """
+                    UPDATE review_attempts
+                    SET publish_state = 'CONFIRMED', publish_confirmed_at = ?,
+                        github_review_id = ?, submitted_at = ?
+                    WHERE review_context_id = ? AND status = 'INVALIDATED'
+                      AND publish_state = 'MAYBE_SENT'
+                      AND github_review_id IS NULL AND submitted_at IS NULL
+                    """,
+                    (
+                        now, github_review_id, submitted_at, review_context_id,
+                    ),
+                ).rowcount
+            if updated_count != 1:
+                raise RuntimeError("review publication attribution CAS failed")
             updated = db.execute(
                 "SELECT * FROM review_attempts WHERE review_context_id = ?",
                 (review_context_id,),
@@ -1031,6 +1636,677 @@ class StateStore:
                 (review_context_id,),
             ).fetchone()
         return _review_attempt_from_row(updated)
+
+    def _apply_github_label_approval(
+        self,
+        *,
+        timeline: tuple[dict[str, object], ...],
+        snapshot_repository_id: int,
+        snapshot_repository: str,
+        snapshot_pull_number: int,
+        snapshot_total_count: int,
+        webhook: WebhookEvent,
+        allowed_approver_ids: frozenset[int],
+        expected_installation_id: int,
+        expected_policy_version: str,
+        target_label: str,
+        clock: GithubClockObservation,
+        monotonic_ns: Callable[[], int],
+    ) -> dict[str, object]:
+        """Persist one signed label decision and all fail-closed effects atomically."""
+        if snapshot_total_count != len(timeline):
+            raise ValueError("timeline count does not match its immutable snapshot")
+        now = _timestamp()
+        with self._approval_transaction() as db:
+            previous = db.execute(
+                """
+                SELECT e.*, a.approval_id, a.attestation_digest,
+                    a.invalidation_reason AS approval_reason
+                FROM github_label_webhook_evidence e
+                LEFT JOIN approvals a ON a.webhook_delivery_id = e.delivery_id
+                WHERE e.delivery_id = ?
+                LIMIT 1
+                """,
+                (webhook.delivery_id,),
+            ).fetchone()
+            if previous is not None:
+                if (
+                    previous["payload_sha256"] != webhook.payload_sha256
+                ):
+                    raise RuntimeError("webhook delivery or payload identity conflicts")
+                generation = None
+                if previous["event_id"] is not None:
+                    event_row = db.execute(
+                        "SELECT generation FROM github_label_events WHERE event_id = ?",
+                        (previous["event_id"],),
+                    ).fetchone()
+                    generation = event_row["generation"] if event_row else None
+                return {
+                    "delivery_id": webhook.delivery_id,
+                    "outcome": previous["outcome"],
+                    "reason": (
+                        previous["rejection_reason"]
+                        or previous["approval_reason"]
+                    ),
+                    "event_id": previous["event_id"],
+                    "approval_id": previous["approval_id"],
+                    "generation": generation,
+                    "attestation_digest": previous["attestation_digest"],
+                    "duplicate": True,
+                }
+
+            def move_job_to_human(reason: str) -> None:
+                job = db.execute(
+                    """
+                    SELECT * FROM review_jobs
+                    WHERE repository_id = ? AND repository = ? AND pull_number = ?
+                      AND head_sha = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (
+                        webhook.repository_id,
+                        webhook.repository,
+                        webhook.pull_number,
+                        webhook.head_sha,
+                    ),
+                ).fetchone()
+                if job is None:
+                    return
+                current = ReviewState(job["state"])
+                if current is ReviewState.HUMAN_REVIEW:
+                    return
+                try:
+                    validate_transition(current, ReviewState.HUMAN_REVIEW)
+                except ValueError:
+                    return
+                db.execute(
+                    """
+                    UPDATE review_jobs
+                    SET state = 'HUMAN_REVIEW', finished_at = ?, last_error = ?,
+                        retry_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, reason, now, job["id"]),
+                )
+                self._invalidate_job_attempts(
+                    db, (job["id"],), reason=reason, now=now
+                )
+
+            def record_evidence(
+                *, event_id: str | None, review_context_id: str | None,
+                outcome: str, reason: str | None
+            ) -> None:
+                db.execute(
+                    """
+                    INSERT INTO github_label_webhook_evidence(
+                        delivery_id, payload_sha256, event_id, review_context_id,
+                        repository_id,
+                        repository, installation_id, pull_number, action,
+                        label_id, label_node_id, label_name,
+                        sender_type, sender_github_user_id, sender_node_id,
+                        sender_login, signed_base_sha, signed_head_sha,
+                        pull_updated_at, outcome, rejection_reason, received_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        webhook.delivery_id,
+                        webhook.payload_sha256,
+                        event_id,
+                        review_context_id,
+                        webhook.repository_id,
+                        webhook.repository,
+                        webhook.installation_id,
+                        webhook.pull_number,
+                        webhook.action,
+                        webhook.label_id,
+                        webhook.label_node_id,
+                        webhook.label_name,
+                        webhook.sender_type,
+                        webhook.sender_id,
+                        webhook.sender_node_id,
+                        webhook.sender_login,
+                        webhook.base_sha,
+                        webhook.head_sha,
+                        webhook.pull_updated_at,
+                        outcome,
+                        reason,
+                        now,
+                    ),
+                )
+
+            def reject(reason: str, *, event_id: str | None = None,
+                       generation: int | None = None,
+                       affects_current: bool = True) -> dict[str, object]:
+                record_evidence(
+                    event_id=event_id, review_context_id=None,
+                    outcome="REJECTED", reason=reason
+                )
+                db.execute(
+                    """
+                    INSERT INTO approval_outbox(
+                        approval_id, delivery_id, action, repository, pull_number,
+                        label_name, payload, created_at
+                    ) VALUES (NULL, ?, 'DISCORD_REPORT', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        webhook.delivery_id, webhook.repository,
+                        webhook.pull_number, webhook.label_name,
+                        json.dumps({"reason": reason}, separators=(",", ":"),
+                                   sort_keys=True), now,
+                    ),
+                )
+                if affects_current:
+                    move_job_to_human(reason)
+                return {
+                    "delivery_id": webhook.delivery_id,
+                    "outcome": "REJECTED",
+                    "reason": reason,
+                    "event_id": event_id,
+                    "approval_id": None,
+                    "generation": generation,
+                    "attestation_digest": None,
+                    "duplicate": False,
+                }
+
+            if (
+                webhook.repository_id != snapshot_repository_id
+                or webhook.repository != snapshot_repository
+                or webhook.pull_number != snapshot_pull_number
+            ):
+                return reject("SNAPSHOT_IDENTITY_MISMATCH")
+
+            stored = db.execute(
+                """
+                SELECT * FROM github_label_events
+                WHERE repository_id = ? AND pull_number = ?
+                ORDER BY ordinal
+                """,
+                (snapshot_repository_id, snapshot_pull_number),
+            ).fetchall()
+            if len(stored) > len(timeline):
+                return reject("TIMELINE_PREFIX_ROLLBACK")
+            immutable_fields = (
+                "event_id", "repository_id", "repository", "pull_number",
+                "label_node_id", "label_name", "action", "actor_type",
+                "actor_github_user_id", "actor_node_id", "actor_login",
+                "created_at", "ordinal", "predecessor_event_id",
+            )
+            for row, item in zip(stored, timeline):
+                if any(row[field] != item[field] for field in immutable_fields):
+                    return reject("TIMELINE_PREFIX_MISMATCH")
+
+            stored_ids = {row["event_id"] for row in stored}
+            matches = [
+                item for item in timeline
+                if item["repository_id"] == webhook.repository_id
+                and item["repository"] == webhook.repository
+                and item["pull_number"] == webhook.pull_number
+                and str(item["action"]).lower() == webhook.action
+                and item["label_node_id"] == webhook.label_node_id
+                and item["label_name"] == webhook.label_name
+                and item["actor_type"] == webhook.sender_type
+                and item["actor_github_user_id"] == webhook.sender_id
+                and item["actor_node_id"] == webhook.sender_node_id
+                and item["actor_login"] == webhook.sender_login
+                and item["created_at"] == webhook.pull_updated_at
+            ]
+            if len(matches) == 1 and matches[0]["event_id"] in stored_ids:
+                recorded = db.execute(
+                    "SELECT generation FROM github_label_events WHERE event_id = ?",
+                    (matches[0]["event_id"],),
+                ).fetchone()
+                return reject(
+                    "TIMELINE_EVENT_ALREADY_RECORDED",
+                    generation=recorded["generation"] if recorded else None,
+                    affects_current=False,
+                )
+            candidates = [
+                item for item in matches if item["event_id"] not in stored_ids
+            ]
+            if len(matches) != 1 or len(candidates) != 1:
+                return reject("TIMELINE_EVENT_MATCH_NOT_UNIQUE")
+            candidate = candidates[0]
+            candidate_index = int(candidate["ordinal"]) - 1
+
+            generations: dict[str, int] = {}
+            active: dict[str, bool] = {}
+            active_node: dict[str, str] = {}
+            event_generation: dict[str, int] = {}
+            malformed = False
+            previous_id: str | None = None
+            for expected_ordinal, item in enumerate(timeline, start=1):
+                if (
+                    item["ordinal"] != expected_ordinal
+                    or item["predecessor_event_id"] != previous_id
+                ):
+                    malformed = True
+                    break
+                label = str(item["label_name"])
+                generation = generations.get(label, 0)
+                is_active = active.get(label, False)
+                if item["action"] == "LABELED":
+                    if is_active:
+                        malformed = True
+                        break
+                    generation += 1
+                    is_active = True
+                    active_node[label] = str(item["label_node_id"])
+                elif item["action"] == "UNLABELED":
+                    if (
+                        not is_active
+                        or active_node.get(label) != item["label_node_id"]
+                    ):
+                        malformed = True
+                        break
+                    is_active = False
+                    active_node.pop(label, None)
+                else:
+                    malformed = True
+                    break
+                generations[label] = generation
+                active[label] = is_active
+                event_generation[str(item["event_id"])] = generation
+                previous_id = str(item["event_id"])
+            if malformed:
+                return reject("TIMELINE_ORDER_AMBIGUOUS")
+            generation = event_generation[str(candidate["event_id"])]
+
+            reason: str | None = None
+            if webhook.action == "labeled" and candidate["actor_type"] != "User":
+                reason = "ACTOR_NOT_USER"
+            elif candidate["label_name"] != target_label:
+                reason = "NON_TARGET_LABEL"
+            elif webhook.installation_id != expected_installation_id:
+                reason = "INSTALLATION_ID_MISMATCH"
+            elif any(
+                item["label_name"] == target_label
+                for item in timeline[candidate_index + 1 :]
+            ):
+                reason = "NON_CURRENT_LABEL_EVENT"
+            elif webhook.action == "labeled" and not active.get(target_label, False):
+                reason = "LABEL_NOT_CURRENTLY_ACTIVE"
+
+            attempt = None
+            content = None
+            job = None
+            ttl = None
+            if reason is None and webhook.action == "labeled":
+                attempt = db.execute(
+                    """
+                    SELECT * FROM review_attempts
+                    WHERE repository_id = ? AND pull_number = ? AND status = 'ACTIVE'
+                    """,
+                    (snapshot_repository_id, snapshot_pull_number),
+                ).fetchone()
+                if attempt is None:
+                    prepared = db.execute(
+                        """
+                        SELECT 1 FROM review_attempts
+                        WHERE repository_id = ? AND pull_number = ?
+                          AND status = 'PREPARED'
+                        LIMIT 1
+                        """,
+                        (snapshot_repository_id, snapshot_pull_number),
+                    ).fetchone()
+                    reason = (
+                        "LABEL_BEFORE_REVIEW"
+                        if prepared is not None
+                        else "NO_ACTIVE_REVIEW_ATTEMPT"
+                    )
+                else:
+                    if attempt["review_decision"] != APPROVAL_REVIEW_DECISION:
+                        reason = "REVIEW_DECISION_NOT_PASS"
+                    else:
+                        content = db.execute(
+                            "SELECT * FROM review_context_contents WHERE content_id = ?",
+                            (attempt["content_id"],),
+                        ).fetchone()
+                        job = db.execute(
+                            "SELECT * FROM review_jobs WHERE id = ?",
+                            (attempt["job_id"],),
+                        ).fetchone()
+                    if reason is None and (content is None or job is None):
+                        reason = "REVIEW_CONTEXT_DEPENDENCY_MISSING"
+                    elif (
+                        reason is None
+                        and job["review_decision"] != APPROVAL_REVIEW_DECISION
+                    ):
+                        reason = "REVIEW_JOB_DECISION_NOT_PASS"
+                    elif reason is None and (
+                        content["repository_id"] != snapshot_repository_id
+                        or content["pull_number"] != snapshot_pull_number
+                        or content["base_sha"] != webhook.base_sha
+                        or content["head_sha"] != webhook.head_sha
+                        or job["base_sha"] != webhook.base_sha
+                        or job["head_sha"] != webhook.head_sha
+                    ):
+                        reason = "SIGNED_REVIEW_CONTEXT_MISMATCH"
+                    elif content["policy_version"] != expected_policy_version:
+                        reason = "POLICY_VERSION_MISMATCH"
+                    elif str(candidate["created_at"]) <= attempt["submitted_at"]:
+                        reason = "LABEL_NOT_AFTER_REVIEW"
+                    elif webhook.sender_id not in allowed_approver_ids:
+                        reason = "APPROVER_NOT_ALLOWED"
+                    else:
+                        created = datetime.strptime(
+                            str(candidate["created_at"]), "%Y-%m-%dT%H:%M:%SZ"
+                        ).replace(tzinfo=timezone.utc)
+                        transaction_now_ns = monotonic_ns()
+                        if (
+                            isinstance(transaction_now_ns, bool)
+                            or not isinstance(transaction_now_ns, int)
+                            or transaction_now_ns < 0
+                        ):
+                            raise ValueError(
+                                "monotonic_ns must return a non-negative integer"
+                            )
+                        ttl = evaluate_approval_ttl(
+                            event_created_at=created,
+                            clock=clock,
+                            now_monotonic_ns=transaction_now_ns,
+                        )
+                        if not ttl.is_valid:
+                            reason = ttl.decision.value
+
+            disposition = (
+                LabelEventDisposition.SIGNED_APPROVAL_CANDIDATE.value
+                if reason is None
+                else LabelEventDisposition.REJECTED_AMBIGUOUS.value
+            )
+            for item in timeline[len(stored) : candidate_index + 1]:
+                item_disposition = (
+                    disposition
+                    if item["event_id"] == candidate["event_id"]
+                    else LabelEventDisposition.ORDER_ONLY_NO_APPROVAL.value
+                )
+                db.execute(
+                    """
+                    INSERT INTO github_label_events(
+                        event_id, repository_id, repository, pull_number,
+                        label_node_id, label_name, action, actor_type,
+                        actor_github_user_id, actor_node_id, actor_login,
+                        created_at, ordinal, predecessor_event_id, generation,
+                        disposition, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    tuple(item[field] for field in immutable_fields)
+                    + (
+                        event_generation[str(item["event_id"])],
+                        item_disposition,
+                        now,
+                    ),
+                )
+                if (
+                    item["label_name"] == target_label
+                    and item["action"] == "UNLABELED"
+                ):
+                    self._invalidate_open_approvals(
+                        db,
+                        db.execute(
+                            """
+                            SELECT * FROM approvals
+                            WHERE repository_id = ? AND pull_number = ?
+                              AND generation = ? AND status = 'ACTIVE'
+                            ORDER BY approval_id
+                            """,
+                            (
+                                snapshot_repository_id,
+                                snapshot_pull_number,
+                                event_generation[str(item["event_id"])],
+                            ),
+                        ).fetchall(),
+                        reason="LABEL_REMOVED",
+                        now=now,
+                    )
+
+            if reason is not None:
+                return reject(
+                    reason,
+                    event_id=str(candidate["event_id"]),
+                    generation=generation,
+                    affects_current=reason not in {
+                        "NON_CURRENT_LABEL_EVENT", "LABEL_BEFORE_REVIEW",
+                    },
+                )
+
+            record_evidence(
+                event_id=str(candidate["event_id"]),
+                review_context_id=(
+                    attempt["review_context_id"] if attempt is not None else None
+                ),
+                outcome="ACCEPTED", reason=None
+            )
+            if webhook.action == "unlabeled":
+                return {
+                    "delivery_id": webhook.delivery_id,
+                    "outcome": "ACCEPTED",
+                    "reason": None,
+                    "event_id": candidate["event_id"],
+                    "approval_id": None,
+                    "generation": generation,
+                    "attestation_digest": None,
+                    "duplicate": False,
+                }
+
+            assert attempt is not None and content is not None and job is not None
+            assert ttl is not None
+            approval_id = new_uuid7()
+            accepted_datetime = datetime.strptime(
+                str(candidate["created_at"]), "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=timezone.utc)
+            accepted_at = accepted_datetime.isoformat(timespec="microseconds")
+            event_created_at = str(candidate["created_at"])
+            expires_at = ttl.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+            approval = Approval(
+                approval_id=approval_id,
+                source=ApprovalSource.GITHUB_LABEL,
+                source_version=APPROVAL_SOURCE_VERSION,
+                status=ApprovalStatus.PENDING,
+                repository_id=snapshot_repository_id,
+                pull_number=snapshot_pull_number,
+                review_context_id=attempt["review_context_id"],
+                review_attempt_id=attempt["review_attempt_id"],
+                content_id=attempt["content_id"],
+                label_event_id=str(candidate["event_id"]),
+                webhook_delivery_id=webhook.delivery_id,
+                approver_github_user_id=webhook.sender_id,
+                generation=generation,
+                event_created_at=accepted_datetime,
+                accepted_at=accepted_datetime,
+                expires_at=ttl.expires_at,
+            )
+            attestation_digest = _approval_attestation_digest(
+                approval_id=approval_id,
+                repository_id=snapshot_repository_id,
+                pull_number=snapshot_pull_number,
+                review_context_id=attempt["review_context_id"],
+                review_attempt_id=attempt["review_attempt_id"],
+                content_id=attempt["content_id"],
+                label_event_id=str(candidate["event_id"]),
+                webhook_delivery_id=webhook.delivery_id,
+                approver_github_user_id=webhook.sender_id,
+                generation=generation,
+                event_created_at=event_created_at,
+                accepted_at=accepted_at,
+                expires_at=expires_at,
+            )
+            with self._allow_approval_write():
+                db.execute(
+                    """
+                    INSERT INTO approvals(
+                        approval_id, source, source_version, status, repository_id,
+                        pull_number, review_context_id, review_attempt_id, content_id,
+                        label_event_id, webhook_delivery_id, approver_github_user_id,
+                        generation, event_created_at, accepted_at, expires_at
+                        , attestation_digest
+                    ) VALUES (?, 'github_label', ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        approval_id, APPROVAL_SOURCE_VERSION, snapshot_repository_id,
+                        snapshot_pull_number, attempt["review_context_id"],
+                        attempt["review_attempt_id"], attempt["content_id"],
+                        candidate["event_id"], webhook.delivery_id, webhook.sender_id,
+                        generation, event_created_at, accepted_at, expires_at,
+                        attestation_digest,
+                    ),
+                )
+            db.execute(
+                """
+                INSERT INTO approval_transition_audit(
+                    approval_id, sequence, from_status, to_status, reason, recorded_at
+                ) VALUES (?, 1, NULL, 'PENDING', NULL, ?)
+                """,
+                (approval_id, now),
+            )
+            with self._allow_approval_write():
+                db.execute(
+                    """
+                    UPDATE approvals SET status = 'ACTIVE'
+                    WHERE approval_id = ? AND status = 'PENDING'
+                    """,
+                    (approval_id,),
+                )
+            db.execute(
+                """
+                INSERT INTO approval_transition_audit(
+                    approval_id, sequence, from_status, to_status, reason, recorded_at
+                ) VALUES (?, 2, 'PENDING', 'ACTIVE', NULL, ?)
+                """,
+                (approval_id, now),
+            )
+            with self._allow_approval_write():
+                db.execute(
+                    """
+                    UPDATE approvals SET status = 'INVALIDATED', invalidated_at = ?,
+                        invalidation_reason = 'ATOMIC_SERVER_GATES_UNAVAILABLE'
+                    WHERE approval_id = ? AND status = 'ACTIVE'
+                    """,
+                    (now, approval_id),
+                )
+            db.execute(
+                """
+                INSERT INTO approval_transition_audit(
+                    approval_id, sequence, from_status, to_status, reason, recorded_at
+                ) VALUES (?, 3, 'ACTIVE', 'INVALIDATED',
+                    'ATOMIC_SERVER_GATES_UNAVAILABLE', ?)
+                """,
+                (approval_id, now),
+            )
+            db.execute(
+                """
+                UPDATE review_jobs SET state = 'HUMAN_REVIEW', finished_at = ?,
+                    last_error = 'ATOMIC_SERVER_GATES_UNAVAILABLE', retry_at = NULL,
+                    updated_at = ? WHERE id = ?
+                """,
+                (now, now, job["id"]),
+            )
+            outbox_payload = json.dumps(
+                {
+                    "approval_id": approval_id,
+                    "reason": "ATOMIC_SERVER_GATES_UNAVAILABLE",
+                    "review_context_id": attempt["review_context_id"],
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            db.executemany(
+                """
+                INSERT INTO approval_outbox(
+                    approval_id, delivery_id, action, repository, pull_number,
+                    label_name, payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        approval_id, webhook.delivery_id, "REMOVE_LABEL",
+                        snapshot_repository, snapshot_pull_number, target_label,
+                        outbox_payload, now,
+                    ),
+                    (
+                        approval_id, webhook.delivery_id, "DISCORD_REPORT",
+                        snapshot_repository, snapshot_pull_number, None,
+                        outbox_payload, now,
+                    ),
+                ),
+            )
+            return {
+                "delivery_id": webhook.delivery_id,
+                "outcome": "ACCEPTED",
+                "reason": "ATOMIC_SERVER_GATES_UNAVAILABLE",
+                "event_id": candidate["event_id"],
+                "approval_id": approval_id,
+                "generation": generation,
+                "attestation_digest": attestation_digest,
+                "duplicate": False,
+            }
+
+    def list_approval_outbox(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                "SELECT * FROM approval_outbox ORDER BY id"
+            ).fetchall()
+
+    def get_approval_record(self, approval_id: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._connection.execute(
+                "SELECT * FROM approvals WHERE approval_id = ?", (approval_id,)
+            ).fetchone()
+
+    def _expire_github_label_approvals(
+        self,
+        *,
+        repository_id: int,
+        repository: str,
+        pull_number: int,
+        clock: GithubClockObservation,
+        monotonic_ns: Callable[[], int],
+    ) -> tuple[tuple[str, str], ...]:
+        now = _timestamp()
+        invalidated: list[tuple[str, str]] = []
+        with self._approval_transaction() as db:
+            rows = db.execute(
+                """
+                SELECT a.* FROM approvals a
+                JOIN review_attempts r
+                  ON r.review_attempt_id = a.review_attempt_id
+                JOIN review_jobs j ON j.id = r.job_id
+                WHERE a.repository_id = ? AND a.pull_number = ?
+                  AND j.repository = ? AND a.status IN ('PENDING', 'ACTIVE')
+                ORDER BY a.approval_id
+                """,
+                (repository_id, pull_number, repository),
+            ).fetchall()
+            for row in rows:
+                event_created_at = datetime.strptime(
+                    row["event_created_at"], "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc)
+                transaction_now_ns = monotonic_ns()
+                if (
+                    isinstance(transaction_now_ns, bool)
+                    or not isinstance(transaction_now_ns, int)
+                    or transaction_now_ns < 0
+                ):
+                    raise ValueError(
+                        "monotonic_ns must return a non-negative integer"
+                    )
+                evaluation = evaluate_approval_ttl(
+                    event_created_at=event_created_at,
+                    clock=clock,
+                    now_monotonic_ns=transaction_now_ns,
+                )
+                if evaluation.is_valid:
+                    continue
+                reason = (
+                    "EXPIRED"
+                    if evaluation.decision.value
+                    == "EXPIRED_OR_WITHIN_SAFETY_MARGIN"
+                    else evaluation.decision.value
+                )
+                self._invalidate_open_approvals(
+                    db, (row,), reason=reason, now=now
+                )
+                invalidated.append((row["approval_id"], reason))
+        return tuple(invalidated)
 
     def list_jobs(
         self,
@@ -1229,6 +2505,20 @@ class StateStore:
         if not job_ids:
             return
         placeholders = ", ".join("?" for _ in job_ids)
+        approval_rows = db.execute(
+            f"""
+            SELECT a.* FROM approvals a
+            JOIN review_attempts r
+              ON r.review_attempt_id = a.review_attempt_id
+            WHERE r.job_id IN ({placeholders})
+              AND a.status IN ('PENDING', 'ACTIVE')
+            ORDER BY a.approval_id
+            """,
+            job_ids,
+        ).fetchall()
+        self._invalidate_open_approvals(
+            db, approval_rows, reason=reason, now=now
+        )
         with self._allow_review_attempt_write():
             db.execute(
                 f"""
@@ -1240,6 +2530,47 @@ class StateStore:
                 """,
                 (now, reason, *job_ids),
             )
+
+    def _invalidate_open_approvals(
+        self,
+        db: sqlite3.Connection,
+        rows: tuple[sqlite3.Row, ...] | list[sqlite3.Row],
+        *,
+        reason: str,
+        now: str,
+    ) -> None:
+        for row in rows:
+            current = ApprovalStatus(row["status"])
+            if current not in {ApprovalStatus.PENDING, ApprovalStatus.ACTIVE}:
+                continue
+            sequence = db.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) + 1
+                FROM approval_transition_audit WHERE approval_id = ?
+                """,
+                (row["approval_id"],),
+            ).fetchone()[0]
+            with self._allow_approval_write():
+                updated = db.execute(
+                    """
+                    UPDATE approvals
+                    SET status = 'INVALIDATED', invalidated_at = ?,
+                        invalidation_reason = ?
+                    WHERE approval_id = ? AND status = ?
+                    """,
+                    (now, reason, row["approval_id"], current.value),
+                ).rowcount
+                if updated != 1:
+                    raise RuntimeError("approval invalidation CAS failed")
+                db.execute(
+                    """
+                    INSERT INTO approval_transition_audit(
+                        approval_id, sequence, from_status, to_status, reason,
+                        recorded_at
+                    ) VALUES (?, ?, ?, 'INVALIDATED', ?, ?)
+                    """,
+                    (row["approval_id"], sequence, current.value, reason, now),
+                )
 
     def _invalidate_if_job_left_review_context(
         self,
@@ -1457,6 +2788,7 @@ def _review_attempt_from_row(row: sqlite3.Row) -> ReviewAttempt:
         review_context_id=row["review_context_id"],
         job_id=row["job_id"],
         content_id=row["content_id"],
+        review_decision=row["review_decision"],
         status=ReviewAttemptStatus(row["status"]),
         github_review_id=row["github_review_id"],
         submitted_at=row["submitted_at"],
@@ -1479,6 +2811,50 @@ def _require_github_timestamp(value: str, field: str) -> str:
     if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
         raise ValueError(f"{field} must be a canonical UTC second timestamp")
     return value
+
+
+def _approval_attestation_digest(
+    *,
+    approval_id: str,
+    repository_id: int,
+    pull_number: int,
+    review_context_id: str,
+    review_attempt_id: str,
+    content_id: str,
+    label_event_id: str,
+    webhook_delivery_id: str,
+    approver_github_user_id: int,
+    generation: int,
+    event_created_at: str,
+    accepted_at: str,
+    expires_at: str,
+) -> str:
+    payload = {
+        "accepted_at": accepted_at,
+        "approval_id": approval_id,
+        "approver_github_user_id_decimal": str(approver_github_user_id),
+        "content_id": content_id,
+        "event_created_at": event_created_at,
+        "expires_at": expires_at,
+        "generation_decimal": str(generation),
+        "label_event_id": label_event_id,
+        "pull_number_decimal": str(pull_number),
+        "repository_id_decimal": str(repository_id),
+        "review_attempt_id": review_attempt_id,
+        "review_context_id": review_context_id,
+        "schema": "dohwa-approval-attestation/v1",
+        "source": "github_label",
+        "source_version": APPROVAL_SOURCE_VERSION,
+        "webhook_delivery_id": webhook_delivery_id,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(_APPROVAL_ATTESTATION_DOMAIN + canonical).hexdigest()
 
 
 def _timestamp() -> str:
