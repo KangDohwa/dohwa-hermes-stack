@@ -27,8 +27,9 @@ except ModuleNotFoundError:
     sys.modules["fastapi"] = fastapi_stub
 
 from reviewer.models import ReviewJob, ReviewState
-from reviewer.orchestrator import ReviewerRuntime
-from reviewer.policy import RepositoryPolicy
+from reviewer.discord_reporter import COMPACT_SUMMARY_UNITS, _discord_units
+from reviewer.orchestrator import ReviewerRuntime, _policy_exclusion_summary
+from reviewer.policy import Eligibility, RepositoryPolicy
 
 
 REPOSITORY = "example/example-repo"
@@ -37,6 +38,114 @@ BASE_SHA = "2" * 40
 
 
 class CommentModeTests(unittest.IsolatedAsyncioTestCase):
+    def test_policy_report_keeps_required_action_before_bounded_path_evidence(self):
+        paths = tuple(
+            f"reviewer/{index}-" + "😀" * 500 + "\n@everyone"
+            for index in range(8)
+        )
+        summary = _policy_exclusion_summary(
+            Eligibility(
+                False,
+                "HUMAN_REVIEW",
+                "high-risk paths changed",
+                reason_code="high_risk_paths",
+                actual=len(paths),
+                limit=0,
+                affected_paths=paths,
+            ),
+            analyzer_ran=False,
+        )
+
+        required, evidence = summary.split("\n근거 경로: ", 1)
+        self.assertLessEqual(_discord_units(required), COMPACT_SUMMARY_UNITS)
+        self.assertLess(_discord_units(summary), 2_000)
+        self.assertIn("필요 조치:", required)
+        self.assertIn("Hermes analyzer: 호출하지 않음", required)
+        self.assertIn("외 3개", evidence)
+        self.assertNotIn("\n", evidence)
+
+    async def test_line_limit_report_has_values_analyzer_status_and_action(self):
+        runtime, job = self._runtime("pass")
+        files = [
+            {
+                "filename": "safe/large.py",
+                "additions": 3_001,
+                "deletions": 0,
+                "patch": "+ok",
+            }
+        ]
+        runtime.github.list_pull_request_files.side_effect = [files]
+
+        await runtime.process_job(job)
+
+        runtime._dispatch.assert_not_awaited()
+        runtime._run_tests.assert_not_awaited()
+        runtime._report.assert_awaited_once()
+        report = runtime._report.await_args
+        self.assertEqual(report.args[:2], (job, "자동 검토 제외"))
+        summary = report.args[2]
+        self.assertIn("변경 줄 3,001줄 / 3,000줄", summary)
+        self.assertIn("Hermes analyzer: 호출하지 않음", summary)
+        self.assertIn("모델 사용량 없음", summary)
+        self.assertIn("필요 조치:", summary)
+        self.assertIn("PR을 변경 줄 수 한도 이하로 분할", summary)
+        runtime.store.transition.assert_called_once_with(
+            job.id,
+            ReviewState.HUMAN_REVIEW,
+            expected=ReviewState.REVIEWING,
+            review_decision="human_review",
+            last_error="changed line limit exceeded",
+        )
+
+    async def test_policy_change_after_analysis_reports_result_not_applied(self):
+        runtime, job = self._runtime("pass")
+        safe_files = [
+            {
+                "filename": "safe/change.py",
+                "additions": 1,
+                "deletions": 0,
+                "patch": "+ok",
+            }
+        ]
+        risky_files = [
+            {
+                "filename": "reviewer/orchestrator.py",
+                "additions": 1,
+                "deletions": 0,
+                "patch": "+changed",
+            }
+        ]
+        runtime.github.list_pull_request_files.side_effect = [
+            safe_files,
+            risky_files,
+        ]
+        runtime.policies[REPOSITORY] = RepositoryPolicy(
+            full_name=REPOSITORY,
+            base_branches=("main",),
+            merge_method="squash",
+            max_files=50,
+            max_changed_lines=3_000,
+            timeout_minutes=20,
+            high_risk_paths=("reviewer/**",),
+            skip_labels=(),
+            test_commands=(),
+            required_checks=(),
+            writable_test_paths=(),
+        )
+
+        await runtime.process_job(job)
+
+        runtime._dispatch.assert_awaited_once()
+        runtime._run_tests.assert_awaited_once()
+        self.assertEqual(runtime._report.await_count, 2)
+        report = runtime._report.await_args
+        self.assertEqual(report.args[:2], (job, "자동 검토 제외"))
+        summary = report.args[2]
+        self.assertIn("고위험 경로 1개 / 0개", summary)
+        self.assertIn("Hermes analyzer: 이미 실행됨", summary)
+        self.assertIn("현재 상태에는 분석 결과를 적용하지 않음", summary)
+        self.assertIn("근거 경로: reviewer/orchestrator.py", summary)
+
     async def test_each_decision_only_creates_comment_review(self):
         for decision, expected_state in (
             ("pass", ReviewState.HUMAN_REVIEW),
