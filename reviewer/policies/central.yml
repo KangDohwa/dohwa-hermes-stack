@@ -1,0 +1,42 @@
+version: 1
+repositories:
+  KangDohwa/dohwa-hermes-stack:
+    base_branches: [main]
+    merge_method: squash
+    limits:
+      max_files: 50
+      max_changed_lines: 3000
+      timeout_minutes: 20
+    tests:
+      - [python3, -m, unittest, discover, -s, tests, -v]
+    required_checks: []
+    writable_test_paths: []
+    high_risk_paths:
+      - ".github/**"
+      - "reviewer/**"
+      - "compose.reviewer.yaml"
+      - "compose*.yml"
+      - "compose*.yaml"
+      - "docker-compose*.yml"
+      - "docker-compose*.yaml"
+      - "Dockerfile*"
+      - "**/Dockerfile*"
+      - "CODEOWNERS"
+      - "**/CODEOWNERS"
+      - "**/*auth*"
+      - "**/*credential*"
+      - "**/*permission*"
+      - "**/*secret*"
+      - "**/*security*"
+      - "**/*token*"
+      - ".env*"
+      - "**/.env*"
+      - "requirements*.txt"
+      - "**/requirements*.txt"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "package-lock.json"
+      - "pnpm-lock.yaml"
+      - "yarn.lock"
+      - "**/migrations/**"
+    skip_labels: [hermes:skip, hold, do-not-merge]

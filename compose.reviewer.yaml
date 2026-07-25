@@ -1,0 +1,142 @@
+name: hermes-reviewer
+
+x-reviewer-security: &reviewer-security
+  init: true
+  read_only: true
+  user: "1001:1001"
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  pids_limit: 128
+  restart: "no"
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  review-orchestrator:
+    <<: *reviewer-security
+    build:
+      context: .
+      dockerfile: reviewer/Dockerfile.orchestrator
+    image: "${REVIEWER_ORCHESTRATOR_IMAGE:-dohwa-hermes-reviewer-orchestrator:local}"
+    container_name: review-orchestrator
+    restart: unless-stopped
+    environment:
+      GITHUB_APP_ID: "${GITHUB_APP_ID:?set GITHUB_APP_ID in the Compose environment}"
+      GITHUB_APP_SLUG: "${GITHUB_APP_SLUG:?set GITHUB_APP_SLUG}"
+      GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github-app.pem
+      GITHUB_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
+      GITHUB_REPOSITORY_ALLOWLIST: "${GITHUB_REPOSITORY_ALLOWLIST:-KangDohwa/dohwa-hermes-stack}"
+      GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/github-webhook-secret
+      DISCORD_WEBHOOK_URL: "${DISCORD_WEBHOOK_URL:?set DISCORD_WEBHOOK_URL in the Compose environment}"
+      REVIEWER_ENABLED: "true"
+      REVIEWER_MODE: comment
+      REVIEWER_REPOSITORIES: "${REVIEWER_REPOSITORIES:-KangDohwa/dohwa-hermes-stack}"
+      REVIEWER_SPOOL: /var/lib/hermes-reviewer/spool
+      REVIEWER_STATE_DB: /var/lib/hermes-reviewer/state.sqlite3
+      TZ: Etc/UTC
+    volumes:
+      - "${REVIEWER_SECRET_ROOT:?set REVIEWER_SECRET_ROOT}/github-app.pem:/run/secrets/github-app.pem:ro"
+      - "${REVIEWER_SECRET_ROOT:?set REVIEWER_SECRET_ROOT}/github-webhook-secret:/run/secrets/github-webhook-secret:ro"
+      - ./data/reviewer:/var/lib/hermes-reviewer
+    networks:
+      - reviewer-ingress
+      - reviewer-egress
+    cpus: 1.0
+    mem_limit: 1g
+    stop_grace_period: 30s
+
+  cloudflared:
+    <<: *reviewer-security
+    image: cloudflare/cloudflared:2026.7.2@sha256:4f6655284ab3d252b7f28fedb19fe6c8fc82ee5b1295c20ac74d475e5398a52d
+    container_name: hermes-reviewer-cloudflared
+    restart: unless-stopped
+    user: "1001:1001"
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --loglevel
+      - error
+      - run
+      - --token-file
+      - /run/secrets/cloudflare-tunnel-token
+    volumes:
+      - "${REVIEWER_SECRET_ROOT:?set REVIEWER_SECRET_ROOT}/cloudflare-tunnel-token:/run/secrets/cloudflare-tunnel-token:ro"
+    depends_on:
+      review-orchestrator:
+        condition: service_started
+    networks:
+      - reviewer-ingress
+      - reviewer-egress
+    cpus: 0.25
+    mem_limit: 128m
+    pids_limit: 64
+    stop_grace_period: 30s
+
+  review-analyzer:
+    <<: *reviewer-security
+    build:
+      context: .
+      dockerfile: reviewer/Dockerfile.analyzer
+    image: "${REVIEWER_ANALYZER_IMAGE:-dohwa-hermes-reviewer-analyzer:local}"
+    container_name: review-analyzer
+    restart: unless-stopped
+    environment:
+      REVIEWER_SPOOL: /var/lib/hermes-reviewer/spool
+      REVIEWER_MODEL: gpt-5.6-sol
+      REVIEWER_PROVIDER: openai-codex
+      TZ: Etc/UTC
+    volumes:
+      - ./data/reviewer/spool/analyzer:/var/lib/hermes-reviewer/spool/analyzer
+      - ./data/reviewer/analyzer-data:/opt/data
+    networks:
+      - analyzer-egress
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 128
+
+  review-executor:
+    <<: *reviewer-security
+    build:
+      context: .
+      dockerfile: reviewer/Dockerfile.executor
+    image: "${REVIEWER_EXECUTOR_IMAGE:-dohwa-hermes-reviewer-executor:local}"
+    container_name: review-executor
+    restart: unless-stopped
+    user: "0:0"
+    cap_add:
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+      - KILL
+    network_mode: none
+    working_dir: /work
+    environment:
+      REVIEWER_SPOOL: /var/lib/hermes-reviewer/spool
+      REVIEWER_WORK_ROOT: /work
+      REVIEWER_POLICY: /app/reviewer/policies/central.yml
+      TZ: Etc/UTC
+    volumes:
+      - type: bind
+        source: ./data/reviewer/spool/executor
+        target: /var/lib/hermes-reviewer/spool/executor
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+      - /work:rw,nosuid,nodev,size=768m,mode=0755
+    cpus: 2.0
+    mem_limit: 2g
+    pids_limit: 256
+
+networks:
+  reviewer-ingress:
+    internal: true
+  reviewer-egress:
+    driver: bridge
+  analyzer-egress:
+    driver: bridge

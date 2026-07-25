@@ -1,0 +1,1 @@
+{"commands":[["python3","-m","unittest","discover","-s","tests/reviewer","-v"],["python3","-m","unittest","discover","-s","tests","-p","test_discord_presence.py","-v"],["python3","-m","compileall","-q","reviewer","tests"]],"profile_id":"hermes/v1","schema":"candidate-command-profile/v1"}

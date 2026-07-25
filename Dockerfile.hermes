@@ -1,0 +1,13 @@
+FROM nousresearch/hermes-agent:v2026.7.20@sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a
+
+USER root
+COPY --chmod=0444 LICENSE LICENSES/Hermes-Agent-MIT.txt /usr/share/licenses/dohwa-hermes-stack/
+COPY --chmod=0444 THIRD_PARTY_NOTICES.md /usr/share/doc/dohwa-hermes-stack/
+COPY overlays/discord_presence.py /opt/hermes/plugins/platforms/discord/presence.py
+COPY patches/discord-dynamic-presence.patch /tmp/discord-dynamic-presence.patch
+RUN cd /opt/hermes \
+    && git apply --check /tmp/discord-dynamic-presence.patch \
+    && git apply /tmp/discord-dynamic-presence.patch \
+    && /opt/hermes/.venv/bin/python -m py_compile gateway/run.py plugins/platforms/discord/adapter.py plugins/platforms/discord/presence.py \
+    && /opt/hermes/.venv/bin/python -c "from agent.account_usage import _resolve_codex_usage_credentials, _resolve_codex_usage_url; import plugins.platforms.discord.presence" \
+    && rm /tmp/discord-dynamic-presence.patch

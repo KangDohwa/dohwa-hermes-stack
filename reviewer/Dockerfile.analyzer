@@ -1,0 +1,16 @@
+FROM nousresearch/hermes-agent:v2026.7.20@sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app:/opt/hermes \
+    HERMES_HOME=/opt/data \
+    HERMES_WRITE_SAFE_ROOT=/opt/data \
+    HERMES_DISABLE_LAZY_INSTALLS=1
+
+WORKDIR /app
+
+COPY reviewer /app/reviewer
+
+USER 1001:1001
+
+ENTRYPOINT ["/opt/hermes/.venv/bin/python", "-m", "reviewer.analyzer"]

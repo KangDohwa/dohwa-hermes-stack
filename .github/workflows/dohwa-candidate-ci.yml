@@ -1,0 +1,227 @@
+# Public template: this workflow is intentionally fail-closed while
+# ci/candidate-sandbox/v1/manifest.json has provisioned=false. It validates the
+# immutable dispatch envelope and exits before host mutation or candidate execution.
+name: Dohwa candidate CI foundation (unprovisioned)
+run-name: dohwa-candidate-ci:${{ inputs.ci_request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Exact reviewed base SHA
+        required: true
+        type: string
+      head_sha:
+        description: Exact reviewed head SHA
+        required: true
+        type: string
+      merge_descriptor:
+        description: Canonical LF-terminated merge-descriptor/v1 JSON
+        required: true
+        type: string
+      review_context_id:
+        description: Immutable review context identity
+        required: true
+        type: string
+      ci_request_id:
+        description: 256-bit lowercase request ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: none
+
+jobs:
+  candidate-foundation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: none
+    steps:
+      - name: Validate bounded dispatch envelope
+        shell: bash
+        env:
+          INPUT_BASE_SHA: ${{ inputs.base_sha }}
+          INPUT_HEAD_SHA: ${{ inputs.head_sha }}
+          INPUT_MERGE_DESCRIPTOR: ${{ inputs.merge_descriptor }}
+          INPUT_REQUEST_ID: ${{ inputs.ci_request_id }}
+          INPUT_REVIEW_CONTEXT_ID: ${{ inputs.review_context_id }}
+        run: |
+          set -euo pipefail
+          readonly hex40='^[0-9a-f]{40}$'
+          readonly hex64='^[0-9a-f]{64}$'
+          readonly safe_context='^[A-Za-z0-9._:/-]{1,256}$'
+          [[ "$INPUT_BASE_SHA" =~ $hex40 ]]
+          [[ "$INPUT_HEAD_SHA" =~ $hex40 ]]
+          [[ "$INPUT_BASE_SHA" != "$INPUT_HEAD_SHA" ]]
+          [[ "$INPUT_REQUEST_ID" =~ $hex64 ]]
+          [[ "$INPUT_REVIEW_CONTEXT_ID" =~ $safe_context ]]
+          (( ${#INPUT_MERGE_DESCRIPTOR} >= 1 ))
+          (( ${#INPUT_MERGE_DESCRIPTOR} <= 65536 ))
+
+      - name: Materialize exact W0 without external Actions
+        shell: bash
+        env:
+          FETCH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          readonly w0="$RUNNER_TEMP/dohwa-w0"
+          test ! -e "$w0"
+          mkdir "$w0"
+          git -C "$w0" init --quiet
+          git -C "$w0" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          git -C "$w0" -c "http.extraheader=AUTHORIZATION: bearer $FETCH_TOKEN" \
+            fetch --quiet --no-tags --depth=1 origin "$GITHUB_SHA"
+          unset FETCH_TOKEN
+          git -C "$w0" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$w0" rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C "$w0" status --porcelain --untracked-files=all)"
+          git -C "$w0" remote remove origin
+
+      - name: Derive immutable identities and run fail-closed hosted probe
+        shell: bash
+        env:
+          INPUT_BASE_SHA: ${{ inputs.base_sha }}
+          INPUT_HEAD_SHA: ${{ inputs.head_sha }}
+          INPUT_MERGE_DESCRIPTOR: ${{ inputs.merge_descriptor }}
+          INPUT_REQUEST_ID: ${{ inputs.ci_request_id }}
+          INPUT_REVIEW_CONTEXT_ID: ${{ inputs.review_context_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          readonly fetched_w0="$RUNNER_TEMP/dohwa-w0"
+          readonly manifest="$fetched_w0/ci/candidate-sandbox/v1/manifest.json"
+          readonly identity="$RUNNER_TEMP/dohwa-derived-identity.json"
+          export DOHWA_IDENTITY_PATH="$identity"
+
+          PYTHONPATH="$fetched_w0" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from reviewer.merge_descriptor import MergeDescriptor
+
+          raw_text = os.environ["INPUT_MERGE_DESCRIPTOR"]
+          if "\x00" in raw_text or len(raw_text.encode("utf-8")) > 65_536:
+              raise SystemExit("invalid merge descriptor envelope")
+          raw = raw_text.encode("utf-8")
+          descriptor = MergeDescriptor.from_canonical_bytes(raw)
+          if descriptor.base_oid != os.environ["INPUT_BASE_SHA"]:
+              raise SystemExit("base SHA does not match descriptor")
+          if descriptor.head_oid != os.environ["INPUT_HEAD_SHA"]:
+              raise SystemExit("head SHA does not match descriptor")
+          if descriptor.workflow_sha != os.environ["GITHUB_SHA"]:
+              raise SystemExit("W0 SHA does not match descriptor")
+          if descriptor.ci_profile != "hermes/v1":
+              raise SystemExit("unexpected CI profile")
+          manifest = Path(os.environ["RUNNER_TEMP"]) / "dohwa-w0/ci/candidate-sandbox/v1/manifest.json"
+          manifest_digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+          identity = {
+              "candidate_sha": descriptor.candidate_oid,
+              "descriptor_digest": descriptor.digest,
+              "manifest_sha256": manifest_digest,
+              "workflow_sha": descriptor.workflow_sha,
+          }
+          target = Path(os.environ["DOHWA_IDENTITY_PATH"])
+          target.write_text(json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          target.chmod(0o600)
+          PY
+
+          readarray -t derived < <(python3 - "$identity" <<'PY'
+          import json
+          import re
+          import sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          if set(value) != {"candidate_sha", "descriptor_digest", "manifest_sha256", "workflow_sha"}:
+              raise SystemExit(1)
+          for key in ("descriptor_digest", "manifest_sha256"):
+              if re.fullmatch(r"[0-9a-f]{64}", value[key]) is None:
+                  raise SystemExit(1)
+          for key in ("candidate_sha", "workflow_sha"):
+              if re.fullmatch(r"[0-9a-f]{40}", value[key]) is None:
+                  raise SystemExit(1)
+          print(value["candidate_sha"])
+          print(value["descriptor_digest"])
+          print(value["manifest_sha256"])
+          print(value["workflow_sha"])
+          PY
+          )
+          readonly candidate_sha="${derived[0]}"
+          readonly descriptor_digest="${derived[1]}"
+          readonly manifest_sha256="${derived[2]}"
+          readonly workflow_sha="${derived[3]}"
+
+          # Public snapshots intentionally exit here while the manifest is unprovisioned.
+          # Provisioning requires independently pinned runtime/image digests and a
+          # dedicated signing public key bound into the immutable W0 manifest.
+          python3 "$fetched_w0/ci/candidate-sandbox/v1/validate_manifest.py" \
+            --manifest "$manifest" --w0-root "$fetched_w0" \
+            --expected-digest "$manifest_sha256" --require-provisioned
+
+          readonly short_id="${INPUT_REQUEST_ID:0:16}"
+          readonly account='dohwa-ci'
+          readonly uid='20001'
+          readonly sub_start='200000'
+          readonly sub_count='65536'
+          readonly trusted_root="/run/dohwa-ci/$INPUT_REQUEST_ID"
+          readonly trusted_w0="/opt/dohwa-w0-$short_id"
+          readonly state="$trusted_root/state.json"
+          readonly receipt="$trusted_root/probe-receipt.json"
+          cleanup() {
+            set +e
+            if sudo test -d "$trusted_root/storage" && sudo test -d "$trusted_root/runroot"; then
+              sudo systemd-run --quiet --wait --collect --pipe \
+                --property="User=$account" --property="Group=$account" --property=Delegate=yes \
+                --setenv="HOME=/home/$account" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
+                python3 "$trusted_w0/ci/candidate-sandbox/v1/cleanup.py" \
+                  --manifest "$trusted_w0/ci/candidate-sandbox/v1/manifest.json" \
+                  --w0-root "$trusted_w0" --expected-digest "$manifest_sha256" \
+                  --request-id "$INPUT_REQUEST_ID" --trusted-root "$trusted_root" \
+                  --storage-root "$trusted_root/storage" --run-root "$trusted_root/runroot" \
+                  --state "$state"
+            fi
+            sudo apparmor_parser -R "$trusted_w0/ci/candidate-sandbox/v1/apparmor.profile" >/dev/null 2>&1 || true
+            sudo userdel --remove "$account" >/dev/null 2>&1 || true
+            sudo rm -rf -- "$trusted_root" "$trusted_w0"
+          }
+          trap cleanup EXIT
+
+          sudo useradd --uid "$uid" --create-home --shell /usr/sbin/nologin "$account"
+          sudo sed -i "/^${account}:/d" /etc/subuid /etc/subgid
+          printf '%s:%s:%s\n' "$account" "$sub_start" "$sub_count" | sudo tee -a /etc/subuid >/dev/null
+          printf '%s:%s:%s\n' "$account" "$sub_start" "$sub_count" | sudo tee -a /etc/subgid >/dev/null
+          sudo install -d -m 0700 -o "$account" -g "$account" "$trusted_root"
+          sudo install -d -m 0700 -o "$account" -g "$account" \
+            "$trusted_root/storage" "$trusted_root/runroot" "/run/user/$uid"
+          sudo install -d -m 0755 "$trusted_w0"
+          sudo cp -a "$fetched_w0/." "$trusted_w0/"
+          sudo chown -R root:root "$trusted_w0"
+          sudo chmod -R go-w "$trusted_w0"
+          sudo apparmor_parser -r -W "$trusted_w0/ci/candidate-sandbox/v1/apparmor.profile"
+
+          sudo systemd-run --quiet --wait --collect --pipe \
+            --property="User=$account" --property="Group=$account" --property=Delegate=yes \
+            --setenv="HOME=/home/$account" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
+            python3 "$trusted_w0/ci/candidate-sandbox/v1/probe_host.py" \
+              --manifest "$trusted_w0/ci/candidate-sandbox/v1/manifest.json" \
+              --w0-root "$trusted_w0" --expected-digest "$manifest_sha256" \
+              --request-id "$INPUT_REQUEST_ID" --descriptor-digest "$descriptor_digest" \
+              --candidate-sha "$candidate_sha" --workflow-sha "$workflow_sha" \
+              --review-context-id "$INPUT_REVIEW_CONTEXT_ID" --trusted-root "$trusted_root" \
+              --storage-root "$trusted_root/storage" --run-root "$trusted_root/runroot" \
+              --receipt "$receipt" --state "$state"
+
+          # Exact-M reconstruction/import is intentionally absent in this local/static foundation.
+          # The gate revalidates the successful receipt, then fails closed without executing PR code.
+          sudo systemd-run --quiet --wait --collect --pipe \
+            --property="User=$account" --property="Group=$account" --property=Delegate=yes \
+            --setenv="HOME=/home/$account" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
+            python3 "$trusted_w0/ci/candidate-sandbox/v1/gate_candidate.py" \
+              --manifest "$trusted_w0/ci/candidate-sandbox/v1/manifest.json" \
+              --w0-root "$trusted_w0" --expected-digest "$manifest_sha256" \
+              --request-id "$INPUT_REQUEST_ID" --descriptor-digest "$descriptor_digest" \
+              --candidate-sha "$candidate_sha" --workflow-sha "$workflow_sha" \
+              --review-context-id "$INPUT_REVIEW_CONTEXT_ID" --receipt "$receipt" --state "$state"
