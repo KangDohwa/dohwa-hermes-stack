@@ -117,6 +117,40 @@ class DecisionTests(unittest.TestCase):
                 head_sha=SHA,
             )
 
+    def test_attempt_reconciliation_allows_exact_context_marker(self):
+        attempt_marker = review_attempt_marker(
+            "Example/repository", 7, SHA, new_uuid7(timestamp_ms=1, random_bits=2)
+        )
+        context_marker = review_context_marker(
+            "Example/repository",
+            42,
+            7,
+            "b" * 40,
+            SHA,
+            "d" * 64,
+            "17",
+            ReviewDecision.PASS,
+        )
+        review = {
+            "id": 9,
+            "body": attempt_marker + "\n" + context_marker + "\nreview",
+            "state": "COMMENTED",
+            "commit_id": SHA,
+            "submitted_at": "2026-07-25T00:00:00Z",
+            "user": {"login": "example-reviewer[bot]", "type": "Bot"},
+        }
+
+        self.assertEqual(
+            review,
+            find_review_attempt_review(
+                [review],
+                attempt_marker,
+                event="COMMENT",
+                actor="example-reviewer[bot]",
+                head_sha=SHA,
+            ),
+        )
+
     def test_schema_three_marker_binds_exact_context_and_trusted_review(self):
         marker = review_context_marker(
             "Example/repository",
