@@ -57,6 +57,7 @@ ALLOWED_TRANSITIONS: Mapping[ReviewState, frozenset[ReviewState]] = {
     ),
     ReviewState.REVIEWING: frozenset(
         {
+            ReviewState.WAITING_READY,
             ReviewState.QUEUED,
             ReviewState.WAITING_CI,
             ReviewState.CHANGES_REQUIRED,
