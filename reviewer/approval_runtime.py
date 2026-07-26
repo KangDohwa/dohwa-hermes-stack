@@ -7,7 +7,11 @@ import sqlite3
 import time
 from typing import Any
 
-from reviewer.approval import ReviewAttempt, ReviewContextContent
+from reviewer.approval import (
+    MAX_GITHUB_REQUEST_RTT_NS,
+    ReviewAttempt,
+    ReviewContextContent,
+)
 from reviewer.approval_adapter import (
     ApprovalTransactionResult,
     process_github_label_approval,
@@ -182,7 +186,11 @@ class ApprovalRuntime:
             event.pull_number,
         )
         for delay in LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS:
-            if _matching_timeline_event_count(snapshot, event) != 0:
+            if (
+                _matching_timeline_event_count(snapshot, event) != 0
+                or snapshot.clock.request_rtt_seconds
+                > MAX_GITHUB_REQUEST_RTT_NS / 1_000_000_000
+            ):
                 break
             time.sleep(delay)
             snapshot = self._github.list_pull_request_label_timeline(

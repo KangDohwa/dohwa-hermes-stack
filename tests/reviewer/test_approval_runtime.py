@@ -117,6 +117,7 @@ def matching_timeline_event(
 def timeline_snapshot(
     event: WebhookEvent,
     *events: LabelTimelineEvent,
+    request_rtt_seconds: float = 0.1,
 ) -> LabelTimelineSnapshot:
     server_date = datetime.strptime(
         event.pull_updated_at or "", "%Y-%m-%dT%H:%M:%SZ"
@@ -133,9 +134,9 @@ def timeline_snapshot(
         clock=GitHubClockObservation(
             response_date=format_datetime(server_date, usegmt=True),
             server_date_epoch_seconds=int(server_date.timestamp()),
-            request_started_monotonic=observed_at - 0.1,
+            request_started_monotonic=observed_at - request_rtt_seconds,
             response_received_monotonic=observed_at,
-            request_rtt_seconds=0.1,
+            request_rtt_seconds=request_rtt_seconds,
             date_status=GitHubClockDateStatus.VALID,
         ),
     )
@@ -473,6 +474,26 @@ class ApprovalRuntimeTests(unittest.TestCase):
         sleep.assert_called_once_with(
             LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS[0]
         )
+
+    def test_label_event_does_not_retry_after_slow_timeline_request(self) -> None:
+        expected = object()
+        event = label_event()
+        slow = timeline_snapshot(event, request_rtt_seconds=2.1)
+        self.github.timeline = slow
+
+        with (
+            patch("reviewer.approval_runtime.time.sleep") as sleep,
+            patch(
+                "reviewer.approval_runtime.process_github_label_approval",
+                return_value=expected,
+            ) as process,
+        ):
+            result = self.runtime.process_label_event(event, policy=policy())
+
+        self.assertIs(expected, result)
+        self.assertEqual(1, self.github.timeline_calls)
+        sleep.assert_not_called()
+        self.assertIs(slow, process.call_args.kwargs["snapshot"])
 
     def test_label_event_retry_is_bounded_before_fail_closed_processing(self) -> None:
         expected = object()
