@@ -2098,8 +2098,15 @@ class StateStore:
                     (
                         webhook.delivery_id, webhook.repository,
                         webhook.pull_number, webhook.label_name,
-                        json.dumps({"reason": reason}, separators=(",", ":"),
-                                   sort_keys=True), now,
+                        json.dumps(
+                            {
+                                "reason": reason,
+                                "sender_type": webhook.sender_type,
+                                "webhook_action": webhook.action,
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ), now,
                     ),
                 )
                 if affects_current:

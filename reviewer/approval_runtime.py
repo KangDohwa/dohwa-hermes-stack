@@ -4,16 +4,25 @@ from dataclasses import dataclass
 import hashlib
 import json
 import sqlite3
+import time
 from typing import Any
 
-from reviewer.approval import ReviewAttempt, ReviewContextContent
+from reviewer.approval import (
+    MAX_GITHUB_REQUEST_RTT_NS,
+    ReviewAttempt,
+    ReviewContextContent,
+)
 from reviewer.approval_adapter import (
     ApprovalTransactionResult,
     process_github_label_approval,
 )
 from reviewer.decision import review_attempt_marker
 from reviewer.discord_reporter import DiscordReporter
-from reviewer.github_client import GitHubAPIError, GitHubClient
+from reviewer.github_client import (
+    GitHubAPIError,
+    GitHubClient,
+    LabelTimelineSnapshot,
+)
 from reviewer.models import ReviewJob, ReviewState, WebhookEvent
 from reviewer.policy import RepositoryPolicy
 from reviewer.review_publisher import ReviewAttemptPublisher, ReviewPublishUnknown
@@ -22,6 +31,8 @@ from reviewer.state import StateStore
 
 
 MAX_REVIEW_BODY_CHARS = 60_000
+# Keep webhook processing bounded while allowing short GitHub GraphQL visibility lag.
+LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS = (0.25, 0.75)
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +185,18 @@ class ApprovalRuntime:
             event.repository,
             event.pull_number,
         )
+        for delay in LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS:
+            if (
+                _matching_timeline_event_count(snapshot, event) != 0
+                or snapshot.clock.request_rtt_seconds
+                > MAX_GITHUB_REQUEST_RTT_NS / 1_000_000_000
+            ):
+                break
+            time.sleep(delay)
+            snapshot = self._github.list_pull_request_label_timeline(
+                event.repository,
+                event.pull_number,
+            )
         installation_id = self._github.installation_id_for_repository(
             event.repository
         )
@@ -380,10 +403,42 @@ def _approval_report_summary(payload: dict[str, Any]) -> str:
             "사유: 원자적 병합 backend가 아직 검증·활성화되지 않았습니다.\n"
             "필요 조치: 사람이 PR 상태와 검토 결과를 확인한 뒤 직접 병합하세요."
         )
+    if (
+        reason == "TIMELINE_EVENT_MATCH_NOT_UNIQUE"
+        and payload.get("webhook_action") == "unlabeled"
+        and payload.get("sender_type") == "Bot"
+    ):
+        return (
+            "도화봇의 승인 label 자동 정리 event가 GitHub timeline에서 "
+            "제한 시간 내 확인되지 않았습니다.\n"
+            "결과: 추가 승인이나 자동 병합 없음\n"
+            "필요 조치: 같은 알림이 반복되면 운영자가 GitHub timeline을 확인하세요."
+        )
     return (
         "승인 요청을 적용하지 않았습니다.\n"
         f"사유: {reason[:180]}\n"
         "필요 조치: exact head/base와 승인 label 순서·승인자를 확인하세요."
+    )
+
+
+def _matching_timeline_event_count(
+    snapshot: LabelTimelineSnapshot,
+    webhook: WebhookEvent,
+) -> int:
+    return sum(
+        1
+        for item in snapshot.events
+        if snapshot.repository_database_id == webhook.repository_id
+        and snapshot.repository == webhook.repository
+        and snapshot.pull_number == webhook.pull_number
+        and item.action.lower() == webhook.action
+        and item.label_node_id == webhook.label_node_id
+        and item.label_name == webhook.label_name
+        and item.actor_type == webhook.sender_type
+        and item.actor_database_id == webhook.sender_id
+        and item.actor_node_id == webhook.sender_node_id
+        and item.actor_login == webhook.sender_login
+        and item.created_at == webhook.pull_updated_at
     )
 
 
