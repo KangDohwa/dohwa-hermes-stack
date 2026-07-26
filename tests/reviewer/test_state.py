@@ -395,6 +395,29 @@ class StateStoreTests(unittest.TestCase):
         with self.assertRaises(InvalidStateTransition):
             self.store.transition(merged.id, ReviewState.QUEUED)
 
+    def test_reviewing_can_return_to_waiting_ready_after_draft_confirmation(self):
+        job = self.store.ingest(event("draft-confirmation")).job
+        reviewing = self.store.transition(
+            job.id,
+            ReviewState.REVIEWING,
+            expected=ReviewState.QUEUED,
+        )
+
+        waiting = self.store.transition(
+            reviewing.id,
+            ReviewState.WAITING_READY,
+            expected=ReviewState.REVIEWING,
+            review_decision="changes_required",
+            findings_hash="f" * 64,
+            github_review_id=7,
+        )
+
+        self.assertEqual(ReviewState.WAITING_READY, waiting.state)
+        self.assertEqual("changes_required", waiting.review_decision)
+        self.assertEqual("f" * 64, waiting.findings_hash)
+        self.assertEqual(7, waiting.github_review_id)
+        self.assertIsNone(waiting.last_error)
+
     def test_merged_webhook_records_sha_and_clears_stale_error(self):
         job = self.store.ingest(event("opened-for-manual-merge")).job
         self.store.transition(job.id, ReviewState.REVIEWING)
