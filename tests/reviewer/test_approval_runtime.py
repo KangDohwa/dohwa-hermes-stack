@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from email.utils import format_datetime
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from reviewer.approval import ReviewAttemptStatus
-from reviewer.approval_runtime import ApprovalRuntime, MAX_REVIEW_BODY_CHARS
+from reviewer.approval_runtime import (
+    ApprovalRuntime,
+    LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS,
+    MAX_REVIEW_BODY_CHARS,
+)
 from reviewer.decision import parse_review_attempt_marker
-from reviewer.github_client import GitHubAPIError
+from reviewer.github_client import (
+    GitHubAPIError,
+    GitHubClockDateStatus,
+    GitHubClockObservation,
+    LabelTimelineEvent,
+    LabelTimelineSnapshot,
+)
 from reviewer.models import ReviewState, WebhookEvent
 from reviewer.policy import RepositoryPolicy
 from reviewer.review_publisher import ReviewPublishUnknown
@@ -43,11 +56,20 @@ def pull_event(*, repository_id: int | None = None) -> WebhookEvent:
     )
 
 
-def label_event() -> WebhookEvent:
+def label_event(
+    *,
+    delivery_id: str = "delivery-label",
+    action: str = "labeled",
+    sender_id: int = 303,
+    sender_login: str = "approver",
+    sender_type: str = "User",
+    pull_updated_at: str = "2026-07-25T00:10:00Z",
+    payload_sha256: str = "d" * 64,
+) -> WebhookEvent:
     return WebhookEvent(
-        delivery_id="delivery-label",
+        delivery_id=delivery_id,
         event_name="pull_request",
-        action="labeled",
+        action=action,
         repository_id=REPOSITORY_ID,
         repository=REPOSITORY,
         installation_id=99,
@@ -60,12 +82,62 @@ def label_event() -> WebhookEvent:
         label_id=1,
         label_node_id="LA_approval",
         label_name=APPROVAL_LABEL,
-        sender_id=303,
-        sender_node_id="U_303",
-        sender_login="approver",
-        sender_type="User",
-        pull_updated_at="2026-07-25T01:00:00Z",
-        payload_sha256="d" * 64,
+        sender_id=sender_id,
+        sender_node_id=f"NODE_{sender_id}",
+        sender_login=sender_login,
+        sender_type=sender_type,
+        pull_updated_at=pull_updated_at,
+        payload_sha256=payload_sha256,
+    )
+
+
+def matching_timeline_event(
+    event: WebhookEvent,
+    *,
+    event_id: str = "LE_label",
+    ordinal: int = 1,
+    predecessor_event_id: str | None = None,
+) -> LabelTimelineEvent:
+    return LabelTimelineEvent(
+        event_id=event_id,
+        action=event.action or "",
+        created_at=event.pull_updated_at or "",
+        actor_type=event.sender_type,
+        actor_node_id=event.sender_node_id,
+        actor_database_id=event.sender_id,
+        actor_login=event.sender_login,
+        label_node_id=event.label_node_id or "",
+        label_name=event.label_name or "",
+        cursor=f"cursor-{ordinal}",
+        ordinal=ordinal,
+        predecessor_event_id=predecessor_event_id,
+    )
+
+
+def timeline_snapshot(
+    event: WebhookEvent,
+    *events: LabelTimelineEvent,
+) -> LabelTimelineSnapshot:
+    server_date = datetime.strptime(
+        event.pull_updated_at or "", "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=timezone.utc)
+    observed_at = time.monotonic()
+    return LabelTimelineSnapshot(
+        repository_node_id="R_repo",
+        repository_database_id=event.repository_id or 0,
+        repository=event.repository or "",
+        pull_number=event.pull_number or 0,
+        timeline_updated_at=event.pull_updated_at or "",
+        total_count=len(events),
+        events=events,
+        clock=GitHubClockObservation(
+            response_date=format_datetime(server_date, usegmt=True),
+            server_date_epoch_seconds=int(server_date.timestamp()),
+            request_started_monotonic=observed_at - 0.1,
+            response_received_monotonic=observed_at,
+            request_rtt_seconds=0.1,
+            date_status=GitHubClockDateStatus.VALID,
+        ),
     )
 
 
@@ -110,6 +182,8 @@ class FakeGitHub:
         self.confirmed_pull = pull()
         self.pull_responses: list[dict] = []
         self.timeline = object()
+        self.timeline_responses: list[object] = []
+        self.timeline_calls = 0
 
     def list_pull_request_reviews(self, repository: str, pull_number: int):
         return list(self.reviews)
@@ -162,6 +236,9 @@ class FakeGitHub:
     def list_pull_request_label_timeline(
         self, repository: str, pull_number: int
     ) -> object:
+        self.timeline_calls += 1
+        if self.timeline_responses:
+            return self.timeline_responses.pop(0)
         return self.timeline
 
     def installation_id_for_repository(self, repository: str) -> int:
@@ -306,6 +383,9 @@ class ApprovalRuntimeTests(unittest.TestCase):
     def test_label_event_uses_authoritative_snapshot_and_bound_policy(self) -> None:
         expected = object()
         event = label_event()
+        self.github.timeline = timeline_snapshot(
+            event, matching_timeline_event(event)
+        )
 
         with patch(
             "reviewer.approval_runtime.process_github_label_approval",
@@ -323,6 +403,121 @@ class ApprovalRuntimeTests(unittest.TestCase):
             expected_policy_version="17",
             target_label=APPROVAL_LABEL,
         )
+
+    def test_label_event_retries_until_timeline_event_is_visible(self) -> None:
+        expected = object()
+        event = label_event()
+        missing = timeline_snapshot(event)
+        visible = timeline_snapshot(event, matching_timeline_event(event))
+        self.github.timeline_responses = [missing, visible]
+
+        with (
+            patch("reviewer.approval_runtime.time.sleep") as sleep,
+            patch(
+                "reviewer.approval_runtime.process_github_label_approval",
+                return_value=expected,
+            ) as process,
+        ):
+            result = self.runtime.process_label_event(event, policy=policy())
+
+        self.assertIs(expected, result)
+        self.assertEqual(2, self.github.timeline_calls)
+        sleep.assert_called_once_with(
+            LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS[0]
+        )
+        self.assertIs(visible, process.call_args.kwargs["snapshot"])
+
+    def test_bot_unlabel_waits_for_visibility_without_rejection_report(self) -> None:
+        self.runtime.publish_pass_review(
+            self.job,
+            pull=pull(),
+            diff="exact diff",
+            body="review passed",
+            findings_hash="f" * 64,
+            policy=policy(),
+        )
+        user_event = label_event()
+        labeled = matching_timeline_event(user_event)
+        self.github.timeline = timeline_snapshot(user_event, labeled)
+        approval = self.runtime.process_label_event(user_event, policy=policy())
+        self.assertEqual("ACCEPTED", approval.outcome)
+        self.assertEqual(2, len(self.store.list_approval_outbox()))
+
+        bot_event = label_event(
+            delivery_id="delivery-bot-unlabel",
+            action="unlabeled",
+            sender_id=404,
+            sender_login=ACTOR,
+            sender_type="Bot",
+            pull_updated_at="2026-07-25T00:11:00Z",
+            payload_sha256="e" * 64,
+        )
+        removed = matching_timeline_event(
+            bot_event,
+            event_id="UNLE_bot_cleanup",
+            ordinal=2,
+            predecessor_event_id=labeled.event_id,
+        )
+        self.github.timeline_responses = [
+            timeline_snapshot(bot_event, labeled),
+            timeline_snapshot(bot_event, labeled, removed),
+        ]
+
+        with patch("reviewer.approval_runtime.time.sleep") as sleep:
+            result = self.runtime.process_label_event(bot_event, policy=policy())
+
+        self.assertEqual("ACCEPTED", result.outcome)
+        self.assertIsNone(result.reason)
+        self.assertIsNone(result.approval_id)
+        self.assertEqual(2, len(self.store.list_approval_outbox()))
+        sleep.assert_called_once_with(
+            LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS[0]
+        )
+
+    def test_label_event_retry_is_bounded_before_fail_closed_processing(self) -> None:
+        expected = object()
+        event = label_event()
+        missing = timeline_snapshot(event)
+        self.github.timeline = missing
+
+        with (
+            patch("reviewer.approval_runtime.time.sleep") as sleep,
+            patch(
+                "reviewer.approval_runtime.process_github_label_approval",
+                return_value=expected,
+            ) as process,
+        ):
+            result = self.runtime.process_label_event(event, policy=policy())
+
+        self.assertIs(expected, result)
+        self.assertEqual(
+            len(LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS) + 1,
+            self.github.timeline_calls,
+        )
+        self.assertEqual(
+            [call(delay) for delay in LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS],
+            sleep.call_args_list,
+        )
+        self.assertIs(missing, process.call_args.kwargs["snapshot"])
+
+    def test_bot_cleanup_rejection_report_is_not_user_approval_failure(self) -> None:
+        self.runtime.deliver_outbox_row(
+            {
+                "action": "DISCORD_REPORT",
+                "repository": REPOSITORY,
+                "pull_number": PULL_NUMBER,
+                "payload": (
+                    '{"reason":"TIMELINE_EVENT_MATCH_NOT_UNIQUE",'
+                    '"sender_type":"Bot",'
+                    '"webhook_action":"unlabeled"}'
+                ),
+            }
+        )
+
+        summary = self.reporter.send.call_args.kwargs["summary"]
+        self.assertIn("자동 정리 event", summary)
+        self.assertIn("추가 승인이나 자동 병합 없음", summary)
+        self.assertNotIn("승인 요청을 적용하지 않았습니다", summary)
 
     def test_outbox_label_404_is_idempotent_and_report_is_bounded(self) -> None:
         self.github.timeline = SimpleNamespace(
