@@ -17,7 +17,6 @@ _REVIEW_ATTEMPT_MARKER = re.compile(
     r"attempt=(?P<review_attempt_id>[0-9a-f-]{36}) "
     r"schema=2 -->$"
 )
-_REVIEW_ATTEMPT_MARKER_PREFIX = "<!-- dohwa-bot-review repo="
 _REVIEW_CONTEXT_MARKER = re.compile(
     r"^<!-- dohwa-bot-review "
     r"repo=(?P<repository>[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}) "
@@ -160,10 +159,13 @@ def find_review_attempt_review(
         body = review.get("body")
         if not isinstance(body, str):
             continue
+        marker_parser = (
+            parse_review_attempt_marker
+            if require_attempt_marker
+            else parse_review_context_marker
+        )
         marker_lines = [
-            line
-            for line in body.splitlines()
-            if line.startswith(_REVIEW_ATTEMPT_MARKER_PREFIX)
+            line for line in body.splitlines() if marker_parser(line) is not None
         ]
         if marker_lines != [marker]:
             continue
