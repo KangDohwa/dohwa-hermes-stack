@@ -1,23 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import sqlite3
-import time
-from typing import Any
+from typing import Any, Callable
 
 from reviewer.approval import (
-    MAX_GITHUB_REQUEST_RTT_NS,
     ReviewAttempt,
     ReviewContextContent,
 )
 from reviewer.approval_adapter import (
     ApprovalTransactionResult,
     process_github_label_approval,
+    require_signed_label_webhook,
 )
 from reviewer.decision import review_attempt_marker
 from reviewer.discord_reporter import DiscordReporter
+from reviewer.github_auth import GitHubAuthError
 from reviewer.github_client import (
     GitHubAPIError,
     GitHubClient,
@@ -31,14 +32,16 @@ from reviewer.state import StateStore
 
 
 MAX_REVIEW_BODY_CHARS = 60_000
-# Keep webhook processing bounded while allowing short GitHub GraphQL visibility lag.
-LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS = (0.25, 0.75)
 
 
 @dataclass(frozen=True, slots=True)
 class PassReviewPublication:
     job: ReviewJob
     attempt: ReviewAttempt
+
+
+class ApprovalReconciliationPending(RuntimeError):
+    pass
 
 
 class ApprovalRuntime:
@@ -51,12 +54,16 @@ class ApprovalRuntime:
         app_actor: str,
         approver_ids: tuple[int, ...],
         approval_label: str,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
         self._github = github
         self._reporter = reporter
         self._approver_ids = approver_ids
         self._approval_label = approval_label
+        if stop_requested is not None and not callable(stop_requested):
+            raise TypeError("stop_requested must be callable")
+        self._stop_requested = stop_requested or (lambda: False)
         self._publisher = ReviewAttemptPublisher(
             store,
             github,
@@ -169,37 +176,80 @@ class ApprovalRuntime:
         )
         return PassReviewPublication(job=waiting, attempt=active)
 
-    def process_label_event(
+    def enqueue_label_event(
         self,
         event: WebhookEvent,
         *,
         policy: RepositoryPolicy,
-    ) -> ApprovalTransactionResult:
-        if event.label_name != self._approval_label:
-            raise ValueError("label event does not target the approval label")
-        if not self._approver_ids:
-            raise RuntimeError("approval runtime has no approver allowlist")
-        if event.repository is None or event.pull_number is None:
-            raise ValueError("label event has no pull request identity")
-        snapshot = self._github.list_pull_request_label_timeline(
-            event.repository,
-            event.pull_number,
+    ) -> bool:
+        self._require_target_label_event(event)
+        require_signed_label_webhook(event)
+        return self._store.enqueue_approval_reconciliation(
+            event,
+            expected_policy_version=policy.policy_version,
         )
-        for delay in LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS:
-            if (
-                _matching_timeline_event_count(snapshot, event) != 0
-                or snapshot.clock.request_rtt_seconds
-                > MAX_GITHUB_REQUEST_RTT_NS / 1_000_000_000
-            ):
-                break
-            time.sleep(delay)
+
+    def process_reconciliation_row(
+        self,
+        row: sqlite3.Row,
+        policy: RepositoryPolicy,
+        *,
+        now: datetime | None = None,
+    ) -> ApprovalTransactionResult:
+        event = _queued_webhook_event(row)
+        self._require_target_label_event(event)
+        self._store.ingest(event)
+        if self.reconciliation_deadline_expired(row, now=now):
+            return self._reject_reconciliation_timeout(
+                row,
+                reason="RECONCILIATION_DEADLINE_EXCEEDED",
+            )
+        try:
             snapshot = self._github.list_pull_request_label_timeline(
                 event.repository,
                 event.pull_number,
+                should_stop=self._stop_requested,
             )
-        installation_id = self._github.installation_id_for_repository(
-            event.repository
-        )
+        except (GitHubAPIError, GitHubAuthError):
+            if self.reconciliation_deadline_expired(row, now=now):
+                return self.reject_reconciliation_after_error(row)
+            raise
+        matches = _matching_timeline_event_count(snapshot, event)
+        if matches == 0:
+            if self.reconciliation_deadline_expired(row, now=now):
+                return self._reject_reconciliation_timeout(
+                    row,
+                    reason="TIMELINE_EVENT_VISIBILITY_TIMEOUT",
+                )
+            raise ApprovalReconciliationPending(
+                "signed label event is not yet visible in the authoritative timeline"
+            )
+        if self.reconciliation_deadline_expired(row, now=now):
+            return self._reject_reconciliation_timeout(
+                row,
+                reason="RECONCILIATION_DEADLINE_EXCEEDED",
+            )
+        if self._stop_requested():
+            raise ApprovalReconciliationPending(
+                "approval reconciliation shutdown requested"
+            )
+        try:
+            installation_id = self._github.installation_id_for_repository(
+                event.repository
+            )
+        except (GitHubAPIError, GitHubAuthError):
+            if self.reconciliation_deadline_expired(row, now=now):
+                return self.reject_reconciliation_after_error(row)
+            raise
+        if self.reconciliation_deadline_expired(row, now=now):
+            return self._reject_reconciliation_timeout(
+                row,
+                reason="RECONCILIATION_DEADLINE_EXCEEDED",
+            )
+        if self._stop_requested():
+            raise ApprovalReconciliationPending(
+                "approval reconciliation shutdown requested"
+            )
         return process_github_label_approval(
             self._store,
             snapshot=snapshot,
@@ -208,7 +258,63 @@ class ApprovalRuntime:
             expected_installation_id=installation_id,
             expected_policy_version=policy.policy_version,
             target_label=self._approval_label,
+            evidence_received_at=str(row["received_at"]),
+            reconciliation_id=int(row["id"]),
+            reconciliation_claimed_at=str(row["claimed_at"]),
+            reconciliation_attempt_count=int(row["attempt_count"]),
         )
+
+    def reject_reconciliation_after_error(
+        self,
+        row: sqlite3.Row,
+    ) -> ApprovalTransactionResult:
+        return self._reject_reconciliation_timeout(
+            row,
+            reason="RECONCILIATION_DEADLINE_EXCEEDED",
+        )
+
+    @staticmethod
+    def reconciliation_deadline_expired(
+        row: sqlite3.Row,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        deadline = datetime.fromisoformat(str(row["deadline_at"]))
+        current = now or datetime.now(timezone.utc)
+        if (
+            deadline.tzinfo is None
+            or deadline.utcoffset() != timezone.utc.utcoffset(deadline)
+        ):
+            raise RuntimeError("approval reconciliation deadline is not UTC")
+        if (
+            current.tzinfo is None
+            or current.utcoffset() != timezone.utc.utcoffset(current)
+        ):
+            raise ValueError("reconciliation clock must be timezone-aware UTC")
+        return current >= deadline
+
+    def _reject_reconciliation_timeout(
+        self,
+        row: sqlite3.Row,
+        *,
+        reason: str,
+    ) -> ApprovalTransactionResult:
+        result = self._store.reject_timed_out_approval_reconciliation(
+            int(row["id"]),
+            reason=reason,
+            claimed_at=str(row["claimed_at"]),
+            attempt_count=int(row["attempt_count"]),
+            affects_current=True,
+        )
+        return ApprovalTransactionResult(**result)
+
+    def _require_target_label_event(self, event: WebhookEvent) -> None:
+        if event.label_name != self._approval_label:
+            raise ValueError("label event does not target the approval label")
+        if not self._approver_ids:
+            raise RuntimeError("approval runtime has no approver allowlist")
+        if event.repository is None or event.pull_number is None:
+            raise ValueError("label event has no pull request identity")
 
     def deliver_outbox_row(self, row: sqlite3.Row) -> None:
         action = str(row["action"])
@@ -391,6 +497,32 @@ class ApprovalRuntime:
         )
 
 
+def _queued_webhook_event(row: sqlite3.Row) -> WebhookEvent:
+    return WebhookEvent(
+        delivery_id=str(row["delivery_id"]),
+        event_name=str(row["event_name"]),
+        action=str(row["action"]),
+        repository_id=int(row["repository_id"]),
+        repository=str(row["repository"]),
+        installation_id=int(row["installation_id"]),
+        pull_number=int(row["pull_number"]),
+        base_sha=str(row["signed_base_sha"]),
+        head_sha=str(row["signed_head_sha"]),
+        is_draft=(None if row["is_draft"] is None else bool(row["is_draft"])),
+        is_merged=(None if row["is_merged"] is None else bool(row["is_merged"])),
+        merge_sha=(None if row["merge_sha"] is None else str(row["merge_sha"])),
+        label_id=int(row["label_id"]),
+        label_node_id=str(row["label_node_id"]),
+        label_name=str(row["label_name"]),
+        sender_id=int(row["sender_github_user_id"]),
+        sender_node_id=str(row["sender_node_id"]),
+        sender_login=str(row["sender_login"]),
+        sender_type=str(row["sender_type"]),
+        pull_updated_at=str(row["pull_updated_at"]),
+        payload_sha256=str(row["payload_sha256"]),
+    )
+
+
 def _approval_report_summary(payload: dict[str, Any]) -> str:
     reason = str(payload.get("reason") or "UNKNOWN_APPROVAL_RESULT")
     approval_id = payload.get("approval_id")
@@ -404,7 +536,11 @@ def _approval_report_summary(payload: dict[str, Any]) -> str:
             "필요 조치: 사람이 PR 상태와 검토 결과를 확인한 뒤 직접 병합하세요."
         )
     if (
-        reason == "TIMELINE_EVENT_MATCH_NOT_UNIQUE"
+        reason in {
+            "TIMELINE_EVENT_MATCH_NOT_UNIQUE",
+            "TIMELINE_EVENT_VISIBILITY_TIMEOUT",
+            "RECONCILIATION_DEADLINE_EXCEEDED",
+        }
         and payload.get("webhook_action") == "unlabeled"
         and payload.get("sender_type") == "Bot"
     ):

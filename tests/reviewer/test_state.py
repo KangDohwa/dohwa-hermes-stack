@@ -1,10 +1,14 @@
 from pathlib import Path
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import sqlite3
 import tempfile
 import unittest
 
-from reviewer.approval import ReviewContextContent
+from reviewer.approval import (
+    ReviewAttemptStatus,
+    ReviewContextContent,
+)
 from reviewer.merge_descriptor import CIRequestInputs, MergeDescriptor
 from reviewer.models import (
     CIRequestState,
@@ -41,6 +45,59 @@ def event(
         is_merged=merged,
         merge_sha=merge_sha,
     )
+
+
+def approval_event(
+    delivery_id,
+    *,
+    pull_number=7,
+    payload_sha256="f" * 64,
+    action="labeled",
+    label_id=404,
+    label_node_id="LA_approval",
+    label_name="hermes:merge-approved",
+    sender_id=303,
+    sender_type="User",
+    is_draft=False,
+    is_merged=False,
+    merge_sha=None,
+):
+    return WebhookEvent(
+        delivery_id=delivery_id,
+        event_name="pull_request",
+        action=action,
+        repository_id=42,
+        repository="example/example-repo",
+        installation_id=99,
+        pull_number=pull_number,
+        base_sha="b" * 40,
+        head_sha="a" * 40,
+        is_draft=is_draft,
+        is_merged=is_merged,
+        merge_sha=merge_sha,
+        label_id=label_id,
+        label_node_id=label_node_id,
+        label_name=label_name,
+        sender_id=sender_id,
+        sender_node_id=f"U_{sender_id}",
+        sender_login=f"user-{sender_id}",
+        sender_type=sender_type,
+        pull_updated_at="2026-07-28T01:02:03Z",
+        payload_sha256=payload_sha256,
+    )
+
+
+def record_rejected_evidence(store, signed):
+    recorded_at = "2026-07-28T01:02:04+00:00"
+    with store._approval_transaction() as db:
+        store._record_rejected_approval_reconciliation(
+            db,
+            event=signed,
+            reason="TEST_TERMINAL_EVIDENCE",
+            affects_current=False,
+            received_at=recorded_at,
+            now=recorded_at,
+        )
 
 
 def merge_descriptor(**overrides):
@@ -763,6 +820,420 @@ class StateStoreTests(unittest.TestCase):
                 expected_installation_id=99,
                 dispatch_not_before="2026-07-25T00:00:00Z",
             )
+
+    def test_approval_reconciliation_enqueue_is_durable_and_idempotent(self):
+        received = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
+        signed = approval_event("approval-delivery")
+
+        self.assertTrue(
+            self.store.enqueue_approval_reconciliation(
+                signed,
+                expected_policy_version="policy-v1",
+                now=received,
+            )
+        )
+        self.assertFalse(
+            self.store.enqueue_approval_reconciliation(
+                signed,
+                expected_policy_version="policy-v2",
+                window_seconds=300,
+                now=received + timedelta(minutes=1),
+            )
+        )
+
+        row = self.store.list_approval_reconciliations()[0]
+        self.assertEqual("policy-v1", row["expected_policy_version"])
+        self.assertEqual(
+            received.isoformat(timespec="microseconds"),
+            row["received_at"],
+        )
+        self.assertEqual(
+            (received + timedelta(seconds=120)).isoformat(
+                timespec="microseconds"
+            ),
+            row["deadline_at"],
+        )
+        self.assertEqual(0, row["is_draft"])
+        self.assertEqual(0, row["is_merged"])
+        self.assertIsNone(row["merge_sha"])
+        with self.assertRaisesRegex(ValueError, "policy_version is invalid"):
+            self.store.enqueue_approval_reconciliation(
+                approval_event("invalid-policy"),
+                expected_policy_version="policy version",
+                now=received,
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "payload identity conflicts"):
+            self.store.enqueue_approval_reconciliation(
+                replace(signed, payload_sha256="e" * 64),
+                expected_policy_version="policy-v1",
+                now=received,
+            )
+        with self.assertRaisesRegex(RuntimeError, "signed identity conflicts"):
+            self.store.enqueue_approval_reconciliation(
+                replace(signed, sender_login="different-user"),
+                expected_policy_version="policy-v1",
+                now=received,
+            )
+
+        terminal = approval_event("already-terminal", payload_sha256="d" * 64)
+        record_rejected_evidence(self.store, terminal)
+        self.assertFalse(
+            self.store.enqueue_approval_reconciliation(
+                terminal,
+                expected_policy_version="policy-v1",
+                now=received,
+            )
+        )
+        self.assertEqual(1, len(self.store.list_approval_reconciliations()))
+        with self.assertRaisesRegex(RuntimeError, "payload identity conflicts"):
+            self.store.enqueue_approval_reconciliation(
+                replace(terminal, payload_sha256="c" * 64),
+                expected_policy_version="policy-v1",
+                now=received,
+            )
+        self.assertEqual(
+            1,
+            len(self.store.list_approval_reconciliations()),
+        )
+
+    def test_approval_reconciliation_claims_pr_wide_fifo_lanes(self):
+        received = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
+        first_event = approval_event("first")
+        second_event = approval_event(
+            "second",
+            label_id=405,
+            label_node_id="LA_other",
+            label_name="another-label",
+        )
+        other_pull_event = approval_event("other-pull", pull_number=8)
+        for signed in (first_event, second_event, other_pull_event):
+            self.store.enqueue_approval_reconciliation(
+                signed,
+                expected_policy_version="policy-v1",
+                now=received,
+            )
+
+        first = self.store.claim_next_approval_reconciliation(now=received)
+        other_pull = self.store.claim_next_approval_reconciliation(now=received)
+
+        self.assertEqual("first", first["delivery_id"])
+        self.assertEqual("other-pull", other_pull["delivery_id"])
+        self.assertIsNone(
+            self.store.claim_next_approval_reconciliation(now=received)
+        )
+
+        record_rejected_evidence(self.store, first_event)
+        self.store.complete_approval_reconciliation(
+            first["id"],
+            claimed_at=first["claimed_at"],
+            attempt_count=first["attempt_count"],
+            now=received + timedelta(seconds=1),
+        )
+        second = self.store.claim_next_approval_reconciliation(
+            now=received + timedelta(seconds=1)
+        )
+        self.assertEqual("second", second["delivery_id"])
+
+    def test_approval_reconciliation_lease_and_retry_are_cas_guarded(self):
+        received = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
+        signed = approval_event("leased")
+        self.store.enqueue_approval_reconciliation(
+            signed,
+            expected_policy_version="policy-v1",
+            window_seconds=3_600,
+            now=received,
+        )
+        first = self.store.claim_next_approval_reconciliation(now=received)
+
+        self.assertIsNone(
+            self.store.claim_next_approval_reconciliation(
+                now=received + timedelta(minutes=1, seconds=59)
+            )
+        )
+        reclaimed_at = received + timedelta(minutes=2, seconds=1)
+        second = self.store.claim_next_approval_reconciliation(now=reclaimed_at)
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(2, second["attempt_count"])
+
+        with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+            self.store.retry_approval_reconciliation(
+                first["id"],
+                "stale owner",
+                claimed_at=first["claimed_at"],
+                attempt_count=first["attempt_count"],
+                now=reclaimed_at,
+            )
+        self.store.retry_approval_reconciliation(
+            second["id"],
+            "timeline pending",
+            claimed_at=second["claimed_at"],
+            attempt_count=second["attempt_count"],
+            now=reclaimed_at,
+        )
+        persisted = self.store.list_approval_reconciliations()[0]
+        self.assertEqual("timeline pending", persisted["last_error"])
+        self.assertLessEqual(persisted["retry_at"], persisted["deadline_at"])
+        self.assertIsNone(persisted["claimed_at"])
+        self.assertIsNone(persisted["lease_expires_at"])
+        self.assertIsNone(
+            self.store.claim_next_approval_reconciliation(
+                now=reclaimed_at + timedelta(seconds=3)
+            )
+        )
+        third = self.store.claim_next_approval_reconciliation(
+            now=reclaimed_at + timedelta(seconds=4)
+        )
+        self.assertEqual(3, third["attempt_count"])
+        with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+            self.store.complete_approval_reconciliation(
+                second["id"],
+                claimed_at=second["claimed_at"],
+                attempt_count=second["attempt_count"],
+                now=reclaimed_at + timedelta(seconds=4),
+            )
+
+    def test_restart_releases_claim_and_preserves_pr_fifo_lane(self):
+        received = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
+        first_event = approval_event("restart-reconciliation")
+        later_same_pull = approval_event(
+            "restart-later-same-pull",
+            action="unlabeled",
+        )
+        other_pull = approval_event(
+            "restart-other-pull",
+            pull_number=8,
+        )
+        for signed in (first_event, later_same_pull, other_pull):
+            self.store.enqueue_approval_reconciliation(
+                signed,
+                expected_policy_version="policy-v1",
+                now=received,
+            )
+        first = self.store.claim_next_approval_reconciliation(now=received)
+        self.store.close()
+
+        self.store = StateStore(self.db_path)
+        self.store.recover_after_restart()
+        released = self.store.list_approval_reconciliations()[0]
+        self.assertIsNone(released["claimed_at"])
+        self.assertIsNone(released["lease_expires_at"])
+        recovered = self.store.claim_next_approval_reconciliation(
+            now=received + timedelta(seconds=1)
+        )
+        self.assertEqual(first["id"], recovered["id"])
+        self.assertEqual(2, recovered["attempt_count"])
+        self.store.retry_approval_reconciliation(
+            recovered["id"],
+            "restart retry",
+            claimed_at=recovered["claimed_at"],
+            attempt_count=recovered["attempt_count"],
+            now=received + timedelta(seconds=1),
+        )
+
+        parallel = self.store.claim_next_approval_reconciliation(
+            now=received + timedelta(seconds=1)
+        )
+        self.assertEqual("restart-other-pull", parallel["delivery_id"])
+        self.assertIsNone(
+            self.store.claim_next_approval_reconciliation(
+                now=received + timedelta(seconds=1)
+            )
+        )
+        persisted = {
+            row["delivery_id"]: row
+            for row in self.store.list_approval_reconciliations()
+        }
+        self.assertIsNone(
+            persisted["restart-later-same-pull"]["claimed_at"]
+        )
+
+    def test_approval_reconciliation_completion_requires_evidence(self):
+        received = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
+        signed = approval_event("completion-fence")
+        self.store.enqueue_approval_reconciliation(
+            signed,
+            expected_policy_version="policy-v1",
+            now=received,
+        )
+        claimed = self.store.claim_next_approval_reconciliation(now=received)
+
+        with self.assertRaisesRegex(RuntimeError, "terminal evidence"):
+            self.store.complete_approval_reconciliation(
+                claimed["id"],
+                claimed_at=claimed["claimed_at"],
+                attempt_count=claimed["attempt_count"],
+                now=received + timedelta(seconds=1),
+            )
+        self.assertIsNone(
+            self.store.list_approval_reconciliations()[0]["completed_at"]
+        )
+
+        record_rejected_evidence(self.store, signed)
+        self.store.complete_approval_reconciliation(
+            claimed["id"],
+            claimed_at=claimed["claimed_at"],
+            attempt_count=claimed["attempt_count"],
+            now=received + timedelta(seconds=2),
+        )
+        completed = self.store.list_approval_reconciliations()[0]
+        self.assertIsNotNone(completed["completed_at"])
+
+        with self.store._allow_approval_write():
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                self.store._connection.execute(
+                    """
+                    UPDATE approval_reconciliation_queue
+                    SET label_name = 'mutated' WHERE id = ?
+                    """,
+                    (claimed["id"],),
+                )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "durable"):
+            self.store._connection.execute(
+                "DELETE FROM approval_reconciliation_queue WHERE id = ?",
+                (claimed["id"],),
+            )
+
+    def test_timed_out_reconciliation_is_terminal_and_fail_closed(self):
+        received = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
+        job = self.store.ingest(event("timeout-job")).job
+        self.store.transition(job.id, ReviewState.REVIEWING)
+        self.store.transition(job.id, ReviewState.READY_TO_MERGE)
+        signed = approval_event("timeout")
+        self.store.enqueue_approval_reconciliation(
+            signed,
+            expected_policy_version="policy-v1",
+            now=received,
+        )
+        claimed = self.store.claim_next_approval_reconciliation(now=received)
+
+        with self.assertRaisesRegex(RuntimeError, "deadline has not expired"):
+            self.store.reject_timed_out_approval_reconciliation(
+                claimed["id"],
+                reason="TIMELINE_EVENT_VISIBILITY_TIMEOUT",
+                claimed_at=claimed["claimed_at"],
+                attempt_count=claimed["attempt_count"],
+                affects_current=True,
+                now=received + timedelta(seconds=119),
+            )
+        result = self.store.reject_timed_out_approval_reconciliation(
+            claimed["id"],
+            reason="TIMELINE_EVENT_VISIBILITY_TIMEOUT",
+            claimed_at=claimed["claimed_at"],
+            attempt_count=claimed["attempt_count"],
+            affects_current=True,
+            now=received + timedelta(seconds=120),
+        )
+
+        self.assertEqual("REJECTED", result["outcome"])
+        self.assertEqual("TIMELINE_EVENT_VISIBILITY_TIMEOUT", result["reason"])
+        reconciled = self.store.list_approval_reconciliations()[0]
+        self.assertIsNotNone(reconciled["completed_at"])
+        self.assertEqual(result["reason"], reconciled["last_error"])
+        evidence = self.store._connection.execute(
+            """
+            SELECT * FROM github_label_webhook_evidence
+            WHERE delivery_id = 'timeout'
+            """
+        ).fetchone()
+        self.assertEqual("REJECTED", evidence["outcome"])
+        self.assertEqual(
+            received.isoformat(timespec="microseconds"),
+            evidence["received_at"],
+        )
+        self.assertEqual(
+            ReviewState.HUMAN_REVIEW,
+            self.store.get_job_by_id(job.id).state,
+        )
+        self.assertEqual(
+            ["DISCORD_REPORT"],
+            [row["action"] for row in self.store.list_approval_outbox()],
+        )
+
+    def test_bot_unlabel_timeout_fail_closes_current_job_and_attempt(self):
+        received = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
+        job = self.store.ingest(event("bot-timeout-job", pull_number=8)).job
+        self.store.transition(
+            job.id,
+            ReviewState.REVIEWING,
+            review_decision="pass",
+        )
+        context = self.store.store_review_context(
+            ReviewContextContent(
+                repository_id=42,
+                pull_number=8,
+                base_sha="b" * 40,
+                head_sha="a" * 40,
+                merge_base_sha="c" * 40,
+                diff_sha256="d" * 64,
+                policy_version="policy-v1",
+            )
+        )
+        prepared = self.store.prepare_review_attempt(
+            job_id=job.id,
+            content_id=context.content_id,
+            review_decision="pass",
+        )
+        self.store.mark_review_attempt_publish_maybe_sent(
+            prepared.review_context_id
+        )
+        active = self.store.activate_review_attempt(
+            prepared.review_context_id,
+            github_review_id=909,
+            submitted_at="2026-07-28T01:01:00Z",
+        )
+        self.store.transition(job.id, ReviewState.READY_TO_MERGE)
+        signed = approval_event(
+            "bot-timeout",
+            pull_number=8,
+            action="unlabeled",
+            sender_id=808,
+            sender_type="Bot",
+        )
+        self.store.enqueue_approval_reconciliation(
+            signed,
+            expected_policy_version="policy-v1",
+            now=received,
+        )
+        claimed = self.store.claim_next_approval_reconciliation(now=received)
+
+        result = self.store.reject_timed_out_approval_reconciliation(
+            claimed["id"],
+            reason="TIMELINE_EVENT_VISIBILITY_TIMEOUT",
+            claimed_at=claimed["claimed_at"],
+            attempt_count=claimed["attempt_count"],
+            affects_current=True,
+            now=received + timedelta(seconds=120),
+        )
+
+        self.assertEqual("REJECTED", result["outcome"])
+        self.assertEqual(
+            ReviewState.HUMAN_REVIEW,
+            self.store.get_job_by_id(job.id).state,
+        )
+        invalidated = self.store.get_review_attempt(active.review_context_id)
+        self.assertEqual(ReviewAttemptStatus.INVALIDATED, invalidated.status)
+        self.assertEqual(
+            "TIMELINE_EVENT_VISIBILITY_TIMEOUT",
+            invalidated.invalidation_reason,
+        )
+        reconciliation = self.store.list_approval_reconciliations()[0]
+        self.assertIsNotNone(reconciliation["completed_at"])
+        evidence = self.store._connection.execute(
+            """
+            SELECT * FROM github_label_webhook_evidence
+            WHERE delivery_id = 'bot-timeout'
+            """
+        ).fetchone()
+        self.assertEqual("REJECTED", evidence["outcome"])
+        self.assertEqual(
+            "TIMELINE_EVENT_VISIBILITY_TIMEOUT",
+            evidence["rejection_reason"],
+        )
+        outbox = self.store.list_approval_outbox()
+        self.assertEqual(1, len(outbox))
+        self.assertEqual("bot-timeout", outbox[0]["delivery_id"])
+        self.assertEqual("DISCORD_REPORT", outbox[0]["action"])
 
 
 if __name__ == "__main__":

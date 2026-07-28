@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path
 import sqlite3
@@ -184,7 +184,20 @@ class ApprovalTransactionTests(unittest.TestCase):
         expected_policy_version: str = "phase3-v1",
         monotonic_ns=lambda: 100_200_000_000,
         store: StateStore | None = None,
+        reconciliation: sqlite3.Row | None = None,
     ):
+        reconciliation_kwargs = {}
+        if reconciliation is not None:
+            reconciliation_kwargs = {
+                "evidence_received_at": str(reconciliation["received_at"]),
+                "reconciliation_id": int(reconciliation["id"]),
+                "reconciliation_claimed_at": str(
+                    reconciliation["claimed_at"]
+                ),
+                "reconciliation_attempt_count": int(
+                    reconciliation["attempt_count"]
+                ),
+            }
         return process_github_label_approval(
             store or self.store,
             snapshot=timeline or snapshot(timeline_event()),
@@ -194,6 +207,86 @@ class ApprovalTransactionTests(unittest.TestCase):
             expected_policy_version=expected_policy_version,
             target_label=TARGET_LABEL,
             monotonic_ns=monotonic_ns,
+            **reconciliation_kwargs,
+        )
+
+    def test_expired_reconciliation_claim_cannot_apply_approval(self):
+        current = datetime.now(timezone.utc)
+        webhook = signed_label_webhook()
+        self.store.enqueue_approval_reconciliation(
+            webhook,
+            expected_policy_version="phase3-v1",
+            now=current - timedelta(seconds=121),
+        )
+        claimed = self.store.claim_next_approval_reconciliation(now=current)
+        self.assertIsNotNone(claimed)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "reconciliation deadline expired",
+        ):
+            self.process(webhook=webhook, reconciliation=claimed)
+
+        persisted = self.store.list_approval_reconciliations()[0]
+        self.assertIsNone(persisted["completed_at"])
+        self.assertEqual([], self.store.list_approval_outbox())
+
+    def test_reclaimed_reconciliation_rejects_stale_claim_token(self):
+        current = datetime.now(timezone.utc)
+        webhook = signed_label_webhook()
+        self.store.enqueue_approval_reconciliation(
+            webhook,
+            expected_policy_version="phase3-v1",
+            window_seconds=3_600,
+            now=current,
+        )
+        first = self.store.claim_next_approval_reconciliation(now=current)
+        self.assertIsNotNone(first)
+        second = self.store.claim_next_approval_reconciliation(
+            now=current + timedelta(minutes=2, seconds=1)
+        )
+        self.assertIsNotNone(second)
+
+        with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+            self.process(webhook=webhook, reconciliation=first)
+
+        persisted = self.store.list_approval_reconciliations()[0]
+        self.assertEqual(second["claimed_at"], persisted["claimed_at"])
+        self.assertEqual(second["attempt_count"], persisted["attempt_count"])
+        self.assertIsNone(persisted["completed_at"])
+        self.assertEqual([], self.store.list_approval_outbox())
+
+    def test_success_atomically_completes_reconciliation_with_evidence(self):
+        current = datetime.now(timezone.utc)
+        webhook = signed_label_webhook()
+        self.store.enqueue_approval_reconciliation(
+            webhook,
+            expected_policy_version="phase3-v1",
+            now=current,
+        )
+        claimed = self.store.claim_next_approval_reconciliation(now=current)
+        self.assertIsNotNone(claimed)
+
+        result = self.process(webhook=webhook, reconciliation=claimed)
+
+        self.assertEqual("ACCEPTED", result.outcome)
+        persisted = self.store.list_approval_reconciliations()[0]
+        self.assertIsNotNone(persisted["completed_at"])
+        self.assertIsNone(persisted["claimed_at"])
+        self.assertIsNone(persisted["lease_expires_at"])
+        self.assertIsNone(persisted["retry_at"])
+        evidence = self.store._connection.execute(
+            """
+            SELECT outcome FROM github_label_webhook_evidence
+            WHERE delivery_id = ?
+            """,
+            (webhook.delivery_id,),
+        ).fetchone()
+        self.assertIsNotNone(evidence)
+        self.assertEqual("ACCEPTED", evidence["outcome"])
+        self.assertEqual(
+            ["REMOVE_LABEL", "DISCORD_REPORT"],
+            [row["action"] for row in self.store.list_approval_outbox()],
         )
 
     def seed_active_approval(

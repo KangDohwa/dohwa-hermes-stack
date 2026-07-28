@@ -48,6 +48,10 @@ def process_github_label_approval(
     expected_policy_version: str,
     target_label: str,
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    evidence_received_at: str | None = None,
+    reconciliation_id: int | None = None,
+    reconciliation_claimed_at: str | None = None,
+    reconciliation_attempt_count: int | None = None,
 ) -> ApprovalTransactionResult:
     """Reconcile one signed label delivery against an authoritative timeline.
 
@@ -83,7 +87,7 @@ def process_github_label_approval(
         raise ValueError("expected_policy_version must be canonical ASCII")
     if not callable(monotonic_ns):
         raise TypeError("monotonic_ns must be callable")
-    _require_signed_label_webhook(webhook)
+    require_signed_label_webhook(webhook)
 
     clock = _approval_clock(snapshot)
 
@@ -119,6 +123,10 @@ def process_github_label_approval(
         target_label=target_label,
         clock=clock,
         monotonic_ns=monotonic_ns,
+        evidence_received_at=evidence_received_at,
+        reconciliation_id=reconciliation_id,
+        reconciliation_claimed_at=reconciliation_claimed_at,
+        reconciliation_attempt_count=reconciliation_attempt_count,
     )
     return ApprovalTransactionResult(**result)
 
@@ -161,7 +169,7 @@ def _approval_clock(snapshot: LabelTimelineSnapshot) -> GithubClockObservation:
     )
 
 
-def _require_signed_label_webhook(event: WebhookEvent) -> None:
+def require_signed_label_webhook(event: WebhookEvent) -> None:
     required_strings = (
         event.delivery_id,
         event.repository,

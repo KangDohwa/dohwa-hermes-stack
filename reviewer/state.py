@@ -45,6 +45,7 @@ from reviewer.models import (
 COMPATIBLE_STATE_SCHEMA_VERSION = 1
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _APPROVAL_ATTESTATION_DOMAIN = b"dohwa-bot/approval-attestation/v1\0"
+_APPROVAL_RECONCILIATION_CLAIM_LEASE = timedelta(minutes=2)
 
 
 class StateStore:
@@ -145,6 +146,7 @@ class StateStore:
                 self._upgrade_review_attempt_publish_schema(db)
             self._create_phase3_approval_schema(db)
             self._upgrade_approval_outbox_delivery_schema(db)
+            self._create_approval_reconciliation_schema(db)
 
     @staticmethod
     def _create_v1_schema(db: sqlite3.Connection) -> None:
@@ -924,6 +926,167 @@ class StateStore:
             db.execute("ALTER TABLE approval_outbox ADD COLUMN last_error TEXT")
         if "retry_at" not in columns:
             db.execute("ALTER TABLE approval_outbox ADD COLUMN retry_at TEXT")
+
+    @staticmethod
+    def _create_approval_reconciliation_schema(
+        db: sqlite3.Connection,
+    ) -> None:
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS approval_reconciliation_queue (
+                id INTEGER PRIMARY KEY,
+                delivery_id TEXT NOT NULL UNIQUE CHECK(length(delivery_id) > 0),
+                payload_sha256 TEXT NOT NULL
+                    CHECK(length(payload_sha256) = 64
+                        AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+                event_name TEXT NOT NULL CHECK(length(event_name) > 0),
+                action TEXT NOT NULL CHECK(action IN ('labeled', 'unlabeled')),
+                repository_id INTEGER NOT NULL CHECK(repository_id > 0),
+                repository TEXT NOT NULL CHECK(length(repository) > 0),
+                installation_id INTEGER NOT NULL CHECK(installation_id > 0),
+                pull_number INTEGER NOT NULL CHECK(pull_number > 0),
+                signed_base_sha TEXT NOT NULL
+                    CHECK(length(signed_base_sha) = 40
+                        AND signed_base_sha NOT GLOB '*[^0-9a-f]*'),
+                signed_head_sha TEXT NOT NULL
+                    CHECK(length(signed_head_sha) = 40
+                        AND signed_head_sha NOT GLOB '*[^0-9a-f]*'),
+                is_draft INTEGER CHECK(is_draft IN (0, 1)),
+                is_merged INTEGER CHECK(is_merged IN (0, 1)),
+                merge_sha TEXT
+                    CHECK(merge_sha IS NULL OR (
+                        length(merge_sha) = 40
+                        AND merge_sha NOT GLOB '*[^0-9a-f]*'
+                    )),
+                label_id INTEGER NOT NULL CHECK(label_id > 0),
+                label_node_id TEXT NOT NULL CHECK(length(label_node_id) > 0),
+                label_name TEXT NOT NULL CHECK(length(label_name) > 0),
+                sender_github_user_id INTEGER NOT NULL
+                    CHECK(sender_github_user_id > 0),
+                sender_node_id TEXT NOT NULL CHECK(length(sender_node_id) > 0),
+                sender_login TEXT NOT NULL CHECK(length(sender_login) > 0),
+                sender_type TEXT NOT NULL CHECK(length(sender_type) > 0),
+                pull_updated_at TEXT NOT NULL
+                    CHECK(
+                        length(pull_updated_at) = 20
+                        AND pull_updated_at GLOB (
+                            '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T'
+                            || '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+                        )
+                    ),
+                expected_policy_version TEXT NOT NULL
+                    CHECK(
+                        length(expected_policy_version) BETWEEN 1 AND 64
+                        AND expected_policy_version NOT GLOB '*[^A-Za-z0-9._-]*'
+                    ),
+                received_at TEXT NOT NULL,
+                deadline_at TEXT NOT NULL,
+                retry_at TEXT,
+                claimed_at TEXT,
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0
+                    CHECK(attempt_count >= 0),
+                last_error TEXT,
+                completed_at TEXT,
+                CHECK(deadline_at > received_at),
+                CHECK(
+                    (claimed_at IS NULL AND lease_expires_at IS NULL)
+                    OR (claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL)
+                ),
+                CHECK(
+                    completed_at IS NULL
+                    OR (
+                        claimed_at IS NULL
+                        AND lease_expires_at IS NULL
+                        AND retry_at IS NULL
+                    )
+                )
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_approval_reconciliation_claim
+                ON approval_reconciliation_queue(
+                    completed_at, retry_at, lease_expires_at, id
+                )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_approval_reconciliation_lane
+                ON approval_reconciliation_queue(
+                    repository_id, pull_number, id, completed_at
+                )
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_reconciliation_no_direct_insert
+            BEFORE INSERT ON approval_reconciliation_queue
+            WHEN state_store_approval_write_allowed() != 1 BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'approval reconciliation insert is StateStore-managed'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_reconciliation_no_direct_update
+            BEFORE UPDATE ON approval_reconciliation_queue
+            WHEN state_store_approval_write_allowed() != 1 BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'approval reconciliation lifecycle is StateStore-managed'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_reconciliation_identity_no_update
+            BEFORE UPDATE OF id, delivery_id, payload_sha256, event_name, action,
+                repository_id, repository, installation_id, pull_number,
+                signed_base_sha, signed_head_sha, is_draft, is_merged, merge_sha,
+                label_id, label_node_id, label_name, sender_github_user_id,
+                sender_node_id, sender_login, sender_type, pull_updated_at,
+                expected_policy_version, received_at, deadline_at
+            ON approval_reconciliation_queue BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'approval reconciliation identity is immutable'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_reconciliation_completion_fence
+            BEFORE UPDATE OF completed_at ON approval_reconciliation_queue
+            WHEN NEW.completed_at IS NOT NULL
+              AND OLD.completed_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM github_label_webhook_evidence AS evidence
+                  WHERE evidence.delivery_id = NEW.delivery_id
+              )
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'approval reconciliation requires terminal evidence'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_reconciliation_no_reopen
+            BEFORE UPDATE OF completed_at ON approval_reconciliation_queue
+            WHEN OLD.completed_at IS NOT NULL
+              AND NEW.completed_at IS NOT OLD.completed_at
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'approval reconciliation completion is terminal'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS approval_reconciliation_no_delete
+            BEFORE DELETE ON approval_reconciliation_queue BEGIN
+                SELECT RAISE(ABORT, 'approval reconciliation is durable');
+            END
+            """,
+        )
+        for statement in statements:
+            db.execute(statement)
 
     def ingest(self, event: WebhookEvent) -> IngestResult:
         now = _timestamp()
@@ -1959,12 +2122,111 @@ class StateStore:
         target_label: str,
         clock: GithubClockObservation,
         monotonic_ns: Callable[[], int],
+        evidence_received_at: str | None = None,
+        reconciliation_id: int | None = None,
+        reconciliation_claimed_at: str | None = None,
+        reconciliation_attempt_count: int | None = None,
     ) -> dict[str, object]:
         """Persist one signed label decision and all fail-closed effects atomically."""
         if snapshot_total_count != len(timeline):
             raise ValueError("timeline count does not match its immutable snapshot")
-        now = _timestamp()
+        if evidence_received_at is not None:
+            _require_reconciliation_storage_timestamp(evidence_received_at)
+        reconciliation_claim = (
+            reconciliation_id,
+            reconciliation_claimed_at,
+            reconciliation_attempt_count,
+        )
+        if any(value is not None for value in reconciliation_claim):
+            if not all(value is not None for value in reconciliation_claim):
+                raise ValueError(
+                    "approval reconciliation claim fields must be provided together"
+                )
+            if (
+                isinstance(reconciliation_id, bool)
+                or not isinstance(reconciliation_id, int)
+                or reconciliation_id <= 0
+            ):
+                raise ValueError(
+                    "reconciliation_id must be a positive integer"
+                )
+            if (
+                not isinstance(reconciliation_claimed_at, str)
+                or not reconciliation_claimed_at
+            ):
+                raise ValueError(
+                    "reconciliation_claimed_at must be a non-empty string"
+                )
+            if (
+                isinstance(reconciliation_attempt_count, bool)
+                or not isinstance(reconciliation_attempt_count, int)
+                or reconciliation_attempt_count <= 0
+            ):
+                raise ValueError(
+                    "reconciliation_attempt_count must be a positive integer"
+                )
         with self._approval_transaction() as db:
+            now = _timestamp()
+            reconciliation: sqlite3.Row | None = None
+            if reconciliation_id is not None:
+                reconciliation = db.execute(
+                    """
+                    SELECT * FROM approval_reconciliation_queue
+                    WHERE id = ?
+                    """,
+                    (reconciliation_id,),
+                ).fetchone()
+                if reconciliation is None:
+                    raise KeyError(
+                        "unknown approval reconciliation row: "
+                        f"{reconciliation_id}"
+                    )
+                if reconciliation["completed_at"] is not None:
+                    raise RuntimeError(
+                        "approval reconciliation is already terminal"
+                    )
+                self._require_approval_reconciliation_claim(
+                    reconciliation,
+                    claimed_at=reconciliation_claimed_at,
+                    attempt_count=reconciliation_attempt_count,
+                )
+                identity = _approval_reconciliation_identity(webhook)
+                if any(
+                    reconciliation[field] != value
+                    for field, value in identity.items()
+                ):
+                    raise RuntimeError(
+                        "approval reconciliation signed identity conflicts"
+                    )
+                current = datetime.fromisoformat(now)
+                deadline = datetime.fromisoformat(
+                    str(reconciliation["deadline_at"])
+                )
+                lease_expires = datetime.fromisoformat(
+                    str(reconciliation["lease_expires_at"])
+                )
+                if current >= deadline:
+                    raise RuntimeError(
+                        "approval reconciliation deadline expired"
+                    )
+                if current >= lease_expires:
+                    raise RuntimeError(
+                        "approval reconciliation claim lease expired"
+                    )
+
+            def complete_reconciliation() -> None:
+                if reconciliation is None:
+                    return
+                assert reconciliation_claimed_at is not None
+                assert reconciliation_attempt_count is not None
+                self._complete_approval_reconciliation_in_transaction(
+                    db,
+                    reconciliation,
+                    completed_at=now,
+                    claimed_at=reconciliation_claimed_at,
+                    attempt_count=reconciliation_attempt_count,
+                )
+
             previous = db.execute(
                 """
                 SELECT e.*, a.approval_id, a.attestation_digest,
@@ -1981,6 +2243,7 @@ class StateStore:
                     previous["payload_sha256"] != webhook.payload_sha256
                 ):
                     raise RuntimeError("webhook delivery or payload identity conflicts")
+                complete_reconciliation()
                 generation = None
                 if previous["event_id"] is not None:
                     event_row = db.execute(
@@ -2077,9 +2340,10 @@ class StateStore:
                         webhook.pull_updated_at,
                         outcome,
                         reason,
-                        now,
+                        evidence_received_at or now,
                     ),
                 )
+                complete_reconciliation()
 
             def reject(reason: str, *, event_id: str | None = None,
                        generation: int | None = None,
@@ -2557,6 +2821,566 @@ class StateStore:
                 "duplicate": False,
             }
 
+    def enqueue_approval_reconciliation(
+        self,
+        event: WebhookEvent,
+        expected_policy_version: str,
+        *,
+        window_seconds: int = 120,
+        now: datetime | None = None,
+    ) -> bool:
+        _require_approval_reconciliation_event(event)
+        if not isinstance(expected_policy_version, str) or re.fullmatch(
+            r"[A-Za-z0-9._-]{1,64}", expected_policy_version
+        ) is None:
+            raise ValueError("expected_policy_version is invalid")
+        if (
+            isinstance(window_seconds, bool)
+            or not isinstance(window_seconds, int)
+            or not 1 <= window_seconds <= 3_600
+        ):
+            raise ValueError("window_seconds must be an integer from 1 to 3600")
+        received = _reconciliation_datetime(now)
+        received_at = received.isoformat(timespec="microseconds")
+        deadline_at = (
+            received + timedelta(seconds=window_seconds)
+        ).isoformat(timespec="microseconds")
+        identity = _approval_reconciliation_identity(event)
+        with self._approval_transaction() as db:
+            previous = db.execute(
+                """
+                SELECT * FROM approval_reconciliation_queue
+                WHERE delivery_id = ?
+                """,
+                (event.delivery_id,),
+            ).fetchone()
+            if previous is not None:
+                if previous["payload_sha256"] != event.payload_sha256:
+                    raise RuntimeError(
+                        "webhook delivery or payload identity conflicts"
+                    )
+                if any(previous[field] != value for field, value in identity.items()):
+                    raise RuntimeError("webhook delivery signed identity conflicts")
+                return False
+            terminal = db.execute(
+                """
+                SELECT payload_sha256
+                FROM github_label_webhook_evidence
+                WHERE delivery_id = ?
+                """,
+                (event.delivery_id,),
+            ).fetchone()
+            if terminal is not None:
+                if terminal["payload_sha256"] != event.payload_sha256:
+                    raise RuntimeError(
+                        "webhook delivery or payload identity conflicts"
+                    )
+                return False
+            db.execute(
+                """
+                INSERT INTO approval_reconciliation_queue(
+                    delivery_id, payload_sha256, event_name, action,
+                    repository_id, repository, installation_id, pull_number,
+                    signed_base_sha, signed_head_sha, is_draft, is_merged,
+                    merge_sha, label_id, label_node_id, label_name,
+                    sender_github_user_id, sender_node_id, sender_login,
+                    sender_type, pull_updated_at, expected_policy_version,
+                    received_at, deadline_at, retry_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    event.delivery_id,
+                    event.payload_sha256,
+                    event.event_name,
+                    event.action,
+                    event.repository_id,
+                    event.repository,
+                    event.installation_id,
+                    event.pull_number,
+                    event.base_sha,
+                    event.head_sha,
+                    _optional_bool_database_value(event.is_draft),
+                    _optional_bool_database_value(event.is_merged),
+                    event.merge_sha,
+                    event.label_id,
+                    event.label_node_id,
+                    event.label_name,
+                    event.sender_id,
+                    event.sender_node_id,
+                    event.sender_login,
+                    event.sender_type,
+                    event.pull_updated_at,
+                    expected_policy_version,
+                    received_at,
+                    deadline_at,
+                    received_at,
+                ),
+            )
+        return True
+
+    def list_approval_reconciliations(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                "SELECT * FROM approval_reconciliation_queue ORDER BY id"
+            ).fetchall()
+
+    def claim_next_approval_reconciliation(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> sqlite3.Row | None:
+        claimed = _reconciliation_datetime(now)
+        claimed_at = claimed.isoformat(timespec="microseconds")
+        lease_expires_at = (
+            claimed + _APPROVAL_RECONCILIATION_CLAIM_LEASE
+        ).isoformat(timespec="microseconds")
+        with self._approval_transaction() as db:
+            row = db.execute(
+                """
+                SELECT current.*
+                FROM approval_reconciliation_queue AS current
+                WHERE current.completed_at IS NULL
+                  AND current.retry_at IS NOT NULL
+                  AND current.retry_at <= ?
+                  AND (
+                      current.lease_expires_at IS NULL
+                      OR current.lease_expires_at <= ?
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM approval_reconciliation_queue AS prior
+                      WHERE prior.repository_id = current.repository_id
+                        AND prior.pull_number = current.pull_number
+                        AND prior.id < current.id
+                        AND prior.completed_at IS NULL
+                  )
+                ORDER BY current.id
+                LIMIT 1
+                """,
+                (claimed_at, claimed_at),
+            ).fetchone()
+            if row is None:
+                return None
+            updated = db.execute(
+                """
+                UPDATE approval_reconciliation_queue
+                SET claimed_at = ?, lease_expires_at = ?,
+                    attempt_count = attempt_count + 1
+                WHERE id = ? AND completed_at IS NULL
+                  AND (
+                      lease_expires_at IS NULL
+                      OR lease_expires_at <= ?
+                  )
+                """,
+                (claimed_at, lease_expires_at, row["id"], claimed_at),
+            ).rowcount
+            if updated != 1:
+                return None
+            return db.execute(
+                "SELECT * FROM approval_reconciliation_queue WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+
+    def retry_approval_reconciliation(
+        self,
+        reconciliation_id: int,
+        error: str,
+        *,
+        claimed_at: str,
+        attempt_count: int,
+        now: datetime | None = None,
+    ) -> None:
+        message = str(error or "approval reconciliation failed")[:2_000]
+        current = _reconciliation_datetime(now)
+        with self._approval_transaction() as db:
+            row = db.execute(
+                "SELECT * FROM approval_reconciliation_queue WHERE id = ?",
+                (reconciliation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(
+                    f"unknown approval reconciliation row: {reconciliation_id}"
+                )
+            if row["completed_at"] is not None:
+                return
+            self._require_approval_reconciliation_claim(
+                row,
+                claimed_at=claimed_at,
+                attempt_count=attempt_count,
+            )
+            delay = min(2 ** min(int(row["attempt_count"]), 5), 30)
+            deadline = datetime.fromisoformat(str(row["deadline_at"]))
+            retry = min(current + timedelta(seconds=delay), deadline)
+            retry_at = retry.isoformat(timespec="microseconds")
+            updated = db.execute(
+                """
+                UPDATE approval_reconciliation_queue
+                SET claimed_at = NULL, lease_expires_at = NULL,
+                    last_error = ?, retry_at = ?
+                WHERE id = ? AND completed_at IS NULL
+                  AND claimed_at = ? AND attempt_count = ?
+                """,
+                (
+                    message,
+                    retry_at,
+                    reconciliation_id,
+                    claimed_at,
+                    attempt_count,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise RuntimeError("approval reconciliation retry CAS failed")
+
+    def complete_approval_reconciliation(
+        self,
+        reconciliation_id: int,
+        *,
+        claimed_at: str,
+        attempt_count: int,
+        now: datetime | None = None,
+    ) -> None:
+        completed_at = _reconciliation_datetime(now).isoformat(
+            timespec="microseconds"
+        )
+        with self._approval_transaction() as db:
+            row = db.execute(
+                "SELECT * FROM approval_reconciliation_queue WHERE id = ?",
+                (reconciliation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(
+                    f"unknown approval reconciliation row: {reconciliation_id}"
+                )
+            if row["completed_at"] is not None:
+                return
+            self._complete_approval_reconciliation_in_transaction(
+                db,
+                row,
+                completed_at=completed_at,
+                claimed_at=claimed_at,
+                attempt_count=attempt_count,
+            )
+
+    def _complete_approval_reconciliation_in_transaction(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        completed_at: str,
+        claimed_at: str,
+        attempt_count: int,
+        last_error: str | None = None,
+    ) -> None:
+        self._require_approval_reconciliation_claim(
+            row,
+            claimed_at=claimed_at,
+            attempt_count=attempt_count,
+        )
+        evidence = db.execute(
+            """
+            SELECT * FROM github_label_webhook_evidence
+            WHERE delivery_id = ?
+            """,
+            (row["delivery_id"],),
+        ).fetchone()
+        evidence_identity = (
+            ("payload_sha256", "payload_sha256"),
+            ("repository_id", "repository_id"),
+            ("repository", "repository"),
+            ("installation_id", "installation_id"),
+            ("pull_number", "pull_number"),
+            ("action", "action"),
+            ("label_id", "label_id"),
+            ("label_node_id", "label_node_id"),
+            ("label_name", "label_name"),
+            ("sender_type", "sender_type"),
+            ("sender_github_user_id", "sender_github_user_id"),
+            ("sender_node_id", "sender_node_id"),
+            ("sender_login", "sender_login"),
+            ("signed_base_sha", "signed_base_sha"),
+            ("signed_head_sha", "signed_head_sha"),
+            ("pull_updated_at", "pull_updated_at"),
+        )
+        if evidence is None or any(
+            evidence[evidence_field] != row[queue_field]
+            for evidence_field, queue_field in evidence_identity
+        ):
+            raise RuntimeError(
+                "approval reconciliation requires matching terminal evidence"
+            )
+        updated = db.execute(
+            """
+            UPDATE approval_reconciliation_queue
+            SET completed_at = ?, claimed_at = NULL,
+                lease_expires_at = NULL, retry_at = NULL, last_error = ?
+            WHERE id = ? AND completed_at IS NULL
+              AND claimed_at = ? AND attempt_count = ?
+            """,
+            (
+                completed_at,
+                last_error,
+                row["id"],
+                claimed_at,
+                attempt_count,
+            ),
+        ).rowcount
+        if updated != 1:
+            raise RuntimeError("approval reconciliation completion CAS failed")
+
+    def reject_timed_out_approval_reconciliation(
+        self,
+        reconciliation_id: int,
+        *,
+        reason: str,
+        claimed_at: str,
+        attempt_count: int,
+        affects_current: bool,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        reason = _require_reconciliation_reason(reason)
+        if reason not in {
+            "TIMELINE_EVENT_VISIBILITY_TIMEOUT",
+            "RECONCILIATION_DEADLINE_EXCEEDED",
+        }:
+            raise ValueError("unsupported reconciliation timeout reason")
+        if not isinstance(affects_current, bool):
+            raise ValueError("affects_current must be a boolean")
+        completed = _reconciliation_datetime(now)
+        completed_at = completed.isoformat(timespec="microseconds")
+        with self._approval_transaction() as db:
+            row = db.execute(
+                "SELECT * FROM approval_reconciliation_queue WHERE id = ?",
+                (reconciliation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(
+                    f"unknown approval reconciliation row: {reconciliation_id}"
+                )
+            if row["completed_at"] is not None:
+                return self._approval_evidence_result(
+                    db, row["delivery_id"], duplicate=True
+                )
+            self._require_approval_reconciliation_claim(
+                row,
+                claimed_at=claimed_at,
+                attempt_count=attempt_count,
+            )
+            deadline = datetime.fromisoformat(str(row["deadline_at"]))
+            if completed < deadline:
+                raise RuntimeError(
+                    "approval reconciliation deadline has not expired"
+                )
+            event = _approval_reconciliation_event_from_row(row)
+            result = self._record_rejected_approval_reconciliation(
+                db,
+                event=event,
+                reason=reason,
+                affects_current=affects_current,
+                received_at=str(row["received_at"]),
+                now=completed_at,
+            )
+            self._complete_approval_reconciliation_in_transaction(
+                db,
+                row,
+                completed_at=completed_at,
+                claimed_at=claimed_at,
+                attempt_count=attempt_count,
+                last_error=reason,
+            )
+            return result
+
+    @staticmethod
+    def _require_approval_reconciliation_claim(
+        row: sqlite3.Row,
+        *,
+        claimed_at: str,
+        attempt_count: int,
+    ) -> None:
+        if (
+            row["claimed_at"] != claimed_at
+            or row["attempt_count"] != attempt_count
+        ):
+            raise RuntimeError("approval reconciliation claim ownership changed")
+
+    def _record_rejected_approval_reconciliation(
+        self,
+        db: sqlite3.Connection,
+        *,
+        event: WebhookEvent,
+        reason: str,
+        affects_current: bool,
+        received_at: str,
+        now: str,
+    ) -> dict[str, object]:
+        previous = db.execute(
+            """
+            SELECT e.*, a.approval_id, a.attestation_digest,
+                a.invalidation_reason AS approval_reason
+            FROM github_label_webhook_evidence AS e
+            LEFT JOIN approvals AS a
+              ON a.webhook_delivery_id = e.delivery_id
+            WHERE e.delivery_id = ?
+            LIMIT 1
+            """,
+            (event.delivery_id,),
+        ).fetchone()
+        if previous is not None:
+            if previous["payload_sha256"] != event.payload_sha256:
+                raise RuntimeError("webhook delivery or payload identity conflicts")
+            return self._approval_evidence_result(
+                db, event.delivery_id, duplicate=True
+            )
+
+        db.execute(
+            """
+            INSERT INTO github_label_webhook_evidence(
+                delivery_id, payload_sha256, event_id, review_context_id,
+                repository_id, repository, installation_id, pull_number,
+                action, label_id, label_node_id, label_name, sender_type,
+                sender_github_user_id, sender_node_id, sender_login,
+                signed_base_sha, signed_head_sha, pull_updated_at, outcome,
+                rejection_reason, received_at
+            ) VALUES (
+                ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                'REJECTED', ?, ?
+            )
+            """,
+            (
+                event.delivery_id,
+                event.payload_sha256,
+                event.repository_id,
+                event.repository,
+                event.installation_id,
+                event.pull_number,
+                event.action,
+                event.label_id,
+                event.label_node_id,
+                event.label_name,
+                event.sender_type,
+                event.sender_id,
+                event.sender_node_id,
+                event.sender_login,
+                event.base_sha,
+                event.head_sha,
+                event.pull_updated_at,
+                reason,
+                received_at,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO approval_outbox(
+                approval_id, delivery_id, action, repository, pull_number,
+                label_name, payload, created_at
+            ) VALUES (NULL, ?, 'DISCORD_REPORT', ?, ?, ?, ?, ?)
+            """,
+            (
+                event.delivery_id,
+                event.repository,
+                event.pull_number,
+                event.label_name,
+                json.dumps(
+                    {
+                        "reason": reason,
+                        "sender_type": event.sender_type,
+                        "webhook_action": event.action,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        if affects_current:
+            job = db.execute(
+                """
+                SELECT * FROM review_jobs
+                WHERE repository_id = ? AND repository = ? AND pull_number = ?
+                  AND head_sha = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (
+                    event.repository_id,
+                    event.repository,
+                    event.pull_number,
+                    event.head_sha,
+                ),
+            ).fetchone()
+            if job is not None:
+                current = ReviewState(job["state"])
+                if current is not ReviewState.HUMAN_REVIEW:
+                    try:
+                        validate_transition(current, ReviewState.HUMAN_REVIEW)
+                    except ValueError:
+                        pass
+                    else:
+                        db.execute(
+                            """
+                            UPDATE review_jobs
+                            SET state = 'HUMAN_REVIEW', finished_at = ?,
+                                last_error = ?, retry_at = NULL, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (now, reason, now, job["id"]),
+                        )
+                        self._invalidate_job_attempts(
+                            db, (job["id"],), reason=reason, now=now
+                        )
+        return {
+            "delivery_id": event.delivery_id,
+            "outcome": "REJECTED",
+            "reason": reason,
+            "event_id": None,
+            "approval_id": None,
+            "generation": None,
+            "attestation_digest": None,
+            "duplicate": False,
+        }
+
+    @staticmethod
+    def _approval_evidence_result(
+        db: sqlite3.Connection,
+        delivery_id: str,
+        *,
+        duplicate: bool,
+    ) -> dict[str, object]:
+        previous = db.execute(
+            """
+            SELECT e.*, a.approval_id, a.attestation_digest,
+                a.invalidation_reason AS approval_reason
+            FROM github_label_webhook_evidence AS e
+            LEFT JOIN approvals AS a
+              ON a.webhook_delivery_id = e.delivery_id
+            WHERE e.delivery_id = ?
+            LIMIT 1
+            """,
+            (delivery_id,),
+        ).fetchone()
+        if previous is None:
+            raise RuntimeError(
+                "completed approval reconciliation has no terminal evidence"
+            )
+        generation = None
+        if previous["event_id"] is not None:
+            event_row = db.execute(
+                "SELECT generation FROM github_label_events WHERE event_id = ?",
+                (previous["event_id"],),
+            ).fetchone()
+            generation = event_row["generation"] if event_row else None
+        return {
+            "delivery_id": delivery_id,
+            "outcome": previous["outcome"],
+            "reason": previous["rejection_reason"] or previous["approval_reason"],
+            "event_id": previous["event_id"],
+            "approval_id": previous["approval_id"],
+            "generation": generation,
+            "attestation_digest": previous["attestation_digest"],
+            "duplicate": duplicate,
+        }
+
     def list_approval_outbox(self) -> list[sqlite3.Row]:
         with self._lock:
             return self._connection.execute(
@@ -2908,6 +3732,13 @@ class StateStore:
                     WHERE delivered_at IS NULL AND claimed_at IS NOT NULL
                     """
                 )
+                db.execute(
+                    """
+                    UPDATE approval_reconciliation_queue
+                    SET claimed_at = NULL, lease_expires_at = NULL
+                    WHERE completed_at IS NULL AND claimed_at IS NOT NULL
+                    """
+                )
             interrupted = db.execute(
                 "SELECT id FROM review_jobs WHERE state = 'REVIEWING' ORDER BY id"
             ).fetchall()
@@ -3097,6 +3928,161 @@ class StateStore:
             """,
             (now, now, *job_ids),
         )
+
+
+def _require_approval_reconciliation_event(event: WebhookEvent) -> None:
+    required_strings = (
+        event.delivery_id,
+        event.repository,
+        event.base_sha,
+        event.head_sha,
+        event.label_node_id,
+        event.label_name,
+        event.sender_node_id,
+        event.sender_login,
+        event.sender_type,
+        event.pull_updated_at,
+        event.payload_sha256,
+    )
+    required_positive_integers = (
+        event.repository_id,
+        event.installation_id,
+        event.pull_number,
+        event.label_id,
+        event.sender_id,
+    )
+    if (
+        event.event_name != "pull_request"
+        or event.action not in {"labeled", "unlabeled"}
+        or any(not isinstance(value, str) or not value for value in required_strings)
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in required_positive_integers
+        )
+        or _SHA256.fullmatch(event.payload_sha256 or "") is None
+        or re.fullmatch(r"[0-9a-f]{40}", event.base_sha or "") is None
+        or re.fullmatch(r"[0-9a-f]{40}", event.head_sha or "") is None
+        or (
+            event.is_draft is not None
+            and not isinstance(event.is_draft, bool)
+        )
+        or (
+            event.is_merged is not None
+            and not isinstance(event.is_merged, bool)
+        )
+        or (
+            event.merge_sha is not None
+            and re.fullmatch(r"[0-9a-f]{40}", event.merge_sha) is None
+        )
+    ):
+        raise ValueError(
+            "webhook lacks complete signed approval reconciliation evidence"
+        )
+    try:
+        updated = datetime.strptime(
+            event.pull_updated_at or "", "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise ValueError(
+            "pull_updated_at must be a canonical GitHub timestamp"
+        ) from exc
+    if updated.strftime("%Y-%m-%dT%H:%M:%SZ") != event.pull_updated_at:
+        raise ValueError("pull_updated_at must be a canonical GitHub timestamp")
+
+
+def _approval_reconciliation_identity(
+    event: WebhookEvent,
+) -> dict[str, object]:
+    return {
+        "payload_sha256": event.payload_sha256,
+        "event_name": event.event_name,
+        "action": event.action,
+        "repository_id": event.repository_id,
+        "repository": event.repository,
+        "installation_id": event.installation_id,
+        "pull_number": event.pull_number,
+        "signed_base_sha": event.base_sha,
+        "signed_head_sha": event.head_sha,
+        "is_draft": _optional_bool_database_value(event.is_draft),
+        "is_merged": _optional_bool_database_value(event.is_merged),
+        "merge_sha": event.merge_sha,
+        "label_id": event.label_id,
+        "label_node_id": event.label_node_id,
+        "label_name": event.label_name,
+        "sender_github_user_id": event.sender_id,
+        "sender_node_id": event.sender_node_id,
+        "sender_login": event.sender_login,
+        "sender_type": event.sender_type,
+        "pull_updated_at": event.pull_updated_at,
+    }
+
+
+def _approval_reconciliation_event_from_row(row: sqlite3.Row) -> WebhookEvent:
+    return WebhookEvent(
+        delivery_id=str(row["delivery_id"]),
+        event_name=str(row["event_name"]),
+        action=str(row["action"]),
+        repository_id=int(row["repository_id"]),
+        repository=str(row["repository"]),
+        installation_id=int(row["installation_id"]),
+        pull_number=int(row["pull_number"]),
+        base_sha=str(row["signed_base_sha"]),
+        head_sha=str(row["signed_head_sha"]),
+        is_draft=(
+            None if row["is_draft"] is None else bool(row["is_draft"])
+        ),
+        is_merged=(
+            None if row["is_merged"] is None else bool(row["is_merged"])
+        ),
+        merge_sha=row["merge_sha"],
+        label_id=int(row["label_id"]),
+        label_node_id=str(row["label_node_id"]),
+        label_name=str(row["label_name"]),
+        sender_id=int(row["sender_github_user_id"]),
+        sender_node_id=str(row["sender_node_id"]),
+        sender_login=str(row["sender_login"]),
+        sender_type=str(row["sender_type"]),
+        pull_updated_at=str(row["pull_updated_at"]),
+        payload_sha256=str(row["payload_sha256"]),
+    )
+
+
+def _optional_bool_database_value(value: bool | None) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError("signed webhook boolean fields must be booleans")
+    return int(value)
+
+
+def _reconciliation_datetime(value: datetime | None) -> datetime:
+    current = value or datetime.now(timezone.utc)
+    if (
+        not isinstance(current, datetime)
+        or current.tzinfo is None
+        or current.utcoffset() != timedelta(0)
+    ):
+        raise ValueError("approval reconciliation clock must be timezone-aware UTC")
+    return current.astimezone(timezone.utc)
+
+
+def _require_reconciliation_storage_timestamp(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("evidence_received_at must be an ISO timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError("evidence_received_at must be UTC")
+    return value
+
+
+def _require_reconciliation_reason(reason: str) -> str:
+    if not isinstance(reason, str) or not reason or len(reason) > 2_000:
+        raise ValueError("reconciliation rejection reason is required")
+    return reason
+
 
 def _initial_state(event: WebhookEvent) -> ReviewState:
     if event.action == "closed":

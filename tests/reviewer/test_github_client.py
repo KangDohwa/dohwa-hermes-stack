@@ -1228,6 +1228,87 @@ class GitHubClientTests(unittest.TestCase):
         self.assertIn("LABELED_EVENT", requests[0]["query"])
         self.assertIn("UNLABELED_EVENT", requests[0]["query"])
 
+    def test_label_timeline_stop_before_first_page_avoids_network(self):
+        client = self.make_client([])
+
+        with self.assertRaisesRegex(GitHubAPIError, "interrupted"):
+            client.list_pull_request_label_timeline(
+                REPOSITORY,
+                7,
+                should_stop=lambda: True,
+            )
+
+        self.assertEqual([], self.transport.requests)
+
+    def test_label_timeline_stop_between_pages_avoids_next_request(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        client = self.make_client(
+            [
+                self.label_timeline_response(
+                    [first],
+                    total_count=2,
+                    has_next_page=True,
+                    end_cursor="cursor-1",
+                ),
+            ]
+        )
+        stop_checks = iter((False, True))
+
+        with self.assertRaisesRegex(GitHubAPIError, "interrupted"):
+            client.list_pull_request_label_timeline(
+                REPOSITORY,
+                7,
+                should_stop=lambda: next(stop_checks),
+            )
+
+        self.assertEqual(1, len(self.transport.requests))
+        request = self.request_json(self.transport.requests[0])
+        self.assertIsNone(request["variables"]["after"])
+
+    def test_tied_label_timeline_stop_between_verification_pages(self):
+        first = self.label_timeline_event("LE_1", "cursor-1")
+        second = self.label_timeline_event("LE_2", "cursor-2")
+        client = self.make_client(
+            [
+                self.label_timeline_response(
+                    [first, second],
+                    total_count=2,
+                    end_cursor="cursor-2",
+                ),
+                self.label_timeline_response(
+                    [first],
+                    total_count=2,
+                    has_next_page=True,
+                    end_cursor="cursor-1",
+                ),
+                self.label_timeline_response(
+                    [first],
+                    total_count=2,
+                    has_next_page=True,
+                    end_cursor="cursor-1",
+                ),
+            ]
+        )
+        stop_checks = iter((False, False, False, True))
+
+        with self.assertRaisesRegex(GitHubAPIError, "interrupted"):
+            client.list_pull_request_label_timeline(
+                REPOSITORY,
+                7,
+                should_stop=lambda: next(stop_checks),
+            )
+
+        requests = [self.request_json(item) for item in self.transport.requests]
+        self.assertEqual(3, len(requests))
+        self.assertEqual(
+            [None, None, None],
+            [item["variables"]["after"] for item in requests],
+        )
+        self.assertEqual(
+            [100, 1, 100],
+            [item["variables"]["first"] for item in requests],
+        )
+
     def test_label_timeline_preserves_authenticated_http_date_observation(self):
         event = self.label_timeline_event("LE_1", "cursor-1")
         response_date = "Sat, 25 Jul 2026 01:03:00 GMT"
