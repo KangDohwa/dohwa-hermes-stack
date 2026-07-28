@@ -1326,6 +1326,28 @@ class StateStore:
             ).fetchone()
             return IngestResult(True, created, _job_from_row(row))
 
+    def archive_webhook_delivery(self, event: WebhookEvent) -> bool:
+        now = _timestamp()
+        with self._transaction() as db:
+            inserted = db.execute(
+                """
+                INSERT OR IGNORE INTO webhook_deliveries(
+                    delivery_id, event_name, action, repository,
+                    pull_number, head_sha, received_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.delivery_id,
+                    event.event_name,
+                    event.action,
+                    event.repository,
+                    event.pull_number,
+                    event.head_sha,
+                    now,
+                ),
+            )
+        return inserted.rowcount == 1
+
     def get_job(
         self, repository: str, pull_number: int, head_sha: str
     ) -> ReviewJob | None:

@@ -198,7 +198,7 @@ class ApprovalRuntime:
     ) -> ApprovalTransactionResult:
         event = _queued_webhook_event(row)
         self._require_target_label_event(event)
-        self._store.ingest(event)
+        self._store.archive_webhook_delivery(event)
         if self.reconciliation_deadline_expired(row, now=now):
             return self._reject_reconciliation_timeout(
                 row,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path
@@ -494,6 +495,58 @@ class ApprovalRuntimeTests(unittest.TestCase):
             reconciliation_claimed_at="2026-07-25T00:10:01+00:00",
             reconciliation_attempt_count=1,
         )
+
+    def test_reconciliation_archive_does_not_rewind_newer_base_context(self) -> None:
+        current_base_sha = "e" * 40
+        changed = self.store.ingest(
+            replace(
+                pull_event(repository_id=REPOSITORY_ID),
+                delivery_id="delivery-base-change",
+                action="edited",
+                base_sha=current_base_sha,
+            )
+        ).job
+        assert changed is not None
+        changed = self.store.transition(
+            changed.id,
+            ReviewState.REVIEWING,
+            expected=ReviewState.QUEUED,
+        )
+        changed_pull = pull()
+        changed_pull["base"]["sha"] = current_base_sha
+        self.github.confirmed_pull = changed_pull
+        with patch.object(
+            self.github,
+            "get_merge_base_sha",
+            return_value=MERGE_BASE_SHA,
+        ):
+            publication = self.runtime.publish_pass_review(
+                changed,
+                pull=changed_pull,
+                diff="exact current diff",
+                body="review passed",
+                findings_hash="e" * 64,
+                policy=policy(),
+            )
+        event = label_event()
+        self.github.timeline = timeline_snapshot(event)
+
+        with self.assertRaises(ApprovalReconciliationPending):
+            self.runtime.process_reconciliation_row(
+                reconciliation_row(event),
+                policy(),
+            )
+
+        persisted = self.store.get_job(REPOSITORY, PULL_NUMBER, HEAD_SHA)
+        assert persisted is not None
+        attempt = self.store.get_review_attempt(
+            publication.attempt.review_context_id
+        )
+        assert attempt is not None
+        self.assertEqual(current_base_sha, persisted.base_sha)
+        self.assertEqual(ReviewState.READY_TO_MERGE, persisted.state)
+        self.assertEqual(ReviewAttemptStatus.ACTIVE, attempt.status)
+        self.assertTrue(self.store.has_delivery(event.delivery_id))
 
     def test_shutdown_after_exact_timeline_stops_before_installation_or_adapter(
         self,
