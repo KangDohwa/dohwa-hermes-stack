@@ -28,6 +28,7 @@ except ModuleNotFoundError:
     sys.modules["fastapi"] = fastapi_stub
 
 from reviewer.models import ReviewJob, ReviewState, WebhookEvent
+from reviewer.approval_runtime import ApprovalReconciliationPending
 from reviewer.discord_reporter import COMPACT_SUMMARY_UNITS, _discord_units
 from reviewer.orchestrator import ReviewerRuntime, _policy_exclusion_summary
 from reviewer.policy import Eligibility, RepositoryPolicy
@@ -80,32 +81,27 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
             [item.action for item in events],
         )
 
-    async def test_approval_label_is_verified_before_general_ingest(self):
+    async def test_approval_label_is_queued_without_general_ingest(self):
         runtime, _ = self._runtime("pass", mode="draft")
         event = self._approval_label_event()
-        order = []
-        runtime.approval_runtime.process_label_event.side_effect = (
-            lambda *_args, **_kwargs: order.append("approval")
-        )
-        runtime.store.ingest.side_effect = lambda *_args: order.append("ingest")
 
         await runtime.ingest_webhook(event)
 
-        self.assertEqual(["approval", "ingest"], order)
-        runtime.approval_runtime.process_label_event.assert_called_once_with(
+        runtime.approval_runtime.enqueue_label_event.assert_called_once_with(
             event,
             policy=runtime.policies[REPOSITORY],
         )
-        runtime.store.ingest.assert_called_once_with(event)
+        runtime.approval_runtime.process_reconciliation_row.assert_not_called()
+        runtime.store.ingest.assert_not_called()
 
-    async def test_approval_adapter_failure_leaves_delivery_for_github_retry(self):
+    async def test_approval_enqueue_failure_leaves_general_delivery_unrecorded(self):
         runtime, _ = self._runtime("pass", mode="draft")
         event = self._approval_label_event()
-        runtime.approval_runtime.process_label_event.side_effect = RuntimeError(
-            "authoritative timeline unavailable"
+        runtime.approval_runtime.enqueue_label_event.side_effect = RuntimeError(
+            "durable inbox unavailable"
         )
 
-        with self.assertRaisesRegex(RuntimeError, "timeline unavailable"):
+        with self.assertRaisesRegex(RuntimeError, "inbox unavailable"):
             await runtime.ingest_webhook(event)
 
         runtime.store.ingest.assert_not_called()
@@ -116,8 +112,131 @@ class CommentModeTests(unittest.IsolatedAsyncioTestCase):
 
         await runtime.ingest_webhook(event)
 
-        runtime.approval_runtime.process_label_event.assert_not_called()
+        runtime.approval_runtime.enqueue_label_event.assert_not_called()
         runtime.store.ingest.assert_called_once_with(event)
+
+    async def test_comment_mode_terminalizes_expired_pending_row(self):
+        runtime, _ = self._runtime("pass", mode="comment")
+        row = {
+            "id": 11,
+            "repository": REPOSITORY,
+            "claimed_at": "2026-07-25T01:00:00+00:00",
+            "attempt_count": 1,
+        }
+        runtime._stop = asyncio.Event()
+        runtime.store.claim_next_approval_reconciliation.return_value = row
+        runtime.approval_runtime.reconciliation_deadline_expired.return_value = True
+        runtime.approval_runtime.reject_reconciliation_after_error.side_effect = (
+            lambda *_args, **_kwargs: runtime._stop.set()
+        )
+
+        await runtime._approval_reconciliation_loop()
+
+        runtime.store.claim_next_approval_reconciliation.assert_called_once_with()
+        runtime.approval_runtime.process_reconciliation_row.assert_not_called()
+        runtime.approval_runtime.reject_reconciliation_after_error.assert_called_once_with(
+            row
+        )
+        runtime.store.retry_approval_reconciliation.assert_not_called()
+        runtime.store.complete_approval_reconciliation.assert_not_called()
+
+    async def test_reconciliation_worker_retries_pending_row(self):
+        runtime, _ = self._runtime("pass", mode="draft")
+        row = {
+            "id": 12,
+            "repository": REPOSITORY,
+            "claimed_at": "2026-07-25T01:00:01+00:00",
+            "attempt_count": 1,
+        }
+        runtime._stop = asyncio.Event()
+        runtime.store.claim_next_approval_reconciliation.return_value = row
+        runtime.approval_runtime.process_reconciliation_row.side_effect = (
+            ApprovalReconciliationPending("timeline visibility pending")
+        )
+        runtime.approval_runtime.reconciliation_deadline_expired.return_value = False
+        runtime.store.retry_approval_reconciliation.side_effect = (
+            lambda *_args, **_kwargs: runtime._stop.set()
+        )
+
+        await runtime._approval_reconciliation_loop()
+
+        runtime.approval_runtime.process_reconciliation_row.assert_called_once_with(
+            row,
+            policy=runtime.policies[REPOSITORY],
+        )
+        runtime.store.retry_approval_reconciliation.assert_called_once_with(
+            12,
+            "ApprovalReconciliationPending: timeline visibility pending",
+            claimed_at="2026-07-25T01:00:01+00:00",
+            attempt_count=1,
+        )
+        runtime.store.complete_approval_reconciliation.assert_not_called()
+
+    async def test_reconciliation_worker_completes_visible_row(self):
+        runtime, _ = self._runtime("pass", mode="draft")
+        row = {
+            "id": 13,
+            "repository": REPOSITORY,
+            "claimed_at": "2026-07-25T01:00:02+00:00",
+            "attempt_count": 2,
+        }
+        runtime._stop = asyncio.Event()
+        runtime.store.claim_next_approval_reconciliation.return_value = row
+        runtime.approval_runtime.process_reconciliation_row.return_value = object()
+        runtime.store.complete_approval_reconciliation.side_effect = (
+            lambda *_args, **_kwargs: runtime._stop.set()
+        )
+
+        await runtime._approval_reconciliation_loop()
+
+        runtime.approval_runtime.process_reconciliation_row.assert_called_once_with(
+            row,
+            policy=runtime.policies[REPOSITORY],
+        )
+        runtime.store.complete_approval_reconciliation.assert_called_once_with(
+            13,
+            claimed_at="2026-07-25T01:00:02+00:00",
+            attempt_count=2,
+        )
+        runtime.store.retry_approval_reconciliation.assert_not_called()
+
+    async def test_stop_waits_for_reconciliation_before_closing_store(self):
+        runtime, _ = self._runtime("pass", mode="draft")
+        runtime._stop = asyncio.Event()
+        runtime._worker = None
+        runtime._reconciler = None
+        runtime._bootstrapper = None
+        runtime._approval_outbox_sender = None
+        started = asyncio.Event()
+        release = asyncio.Event()
+        order = []
+
+        async def reconciliation_worker():
+            started.set()
+            await release.wait()
+            order.append("reconciliation-complete")
+
+        runtime._approval_reconciliation_worker = asyncio.create_task(
+            reconciliation_worker()
+        )
+        runtime.store.close.side_effect = lambda: order.append("store-close")
+        await started.wait()
+
+        stopping = asyncio.create_task(runtime.stop())
+        await asyncio.sleep(0)
+
+        self.assertFalse(stopping.done())
+        self.assertFalse(runtime._approval_reconciliation_worker.cancelled())
+        runtime.store.close.assert_not_called()
+
+        release.set()
+        await stopping
+
+        self.assertEqual(
+            ["reconciliation-complete", "store-close"],
+            order,
+        )
+        runtime.store.close.assert_called_once_with()
 
     def test_policy_report_keeps_required_action_before_bounded_path_evidence(self):
         paths = tuple(

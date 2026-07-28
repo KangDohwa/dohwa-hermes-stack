@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path
 import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 from reviewer.approval import ReviewAttemptStatus
 from reviewer.approval_runtime import (
+    ApprovalReconciliationPending,
     ApprovalRuntime,
-    LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS,
     MAX_REVIEW_BODY_CHARS,
 )
 from reviewer.decision import parse_review_attempt_marker
@@ -89,6 +90,46 @@ def label_event(
         pull_updated_at=pull_updated_at,
         payload_sha256=payload_sha256,
     )
+
+
+def reconciliation_row(
+    event: WebhookEvent,
+    *,
+    row_id: int = 1,
+    deadline_at: datetime | None = None,
+) -> dict[str, object]:
+    return {
+        "id": row_id,
+        "delivery_id": event.delivery_id,
+        "event_name": event.event_name,
+        "payload_sha256": event.payload_sha256,
+        "repository_id": event.repository_id,
+        "repository": event.repository,
+        "installation_id": event.installation_id,
+        "pull_number": event.pull_number,
+        "action": event.action,
+        "is_draft": event.is_draft,
+        "is_merged": event.is_merged,
+        "merge_sha": event.merge_sha,
+        "label_id": event.label_id,
+        "label_node_id": event.label_node_id,
+        "label_name": event.label_name,
+        "sender_type": event.sender_type,
+        "sender_github_user_id": event.sender_id,
+        "sender_node_id": event.sender_node_id,
+        "sender_login": event.sender_login,
+        "signed_base_sha": event.base_sha,
+        "signed_head_sha": event.head_sha,
+        "pull_updated_at": event.pull_updated_at,
+        "expected_policy_version": policy().policy_version,
+        "received_at": "2026-07-25T00:10:01+00:00",
+        "deadline_at": (
+            deadline_at
+            or datetime.now(timezone.utc) + timedelta(minutes=1)
+        ).isoformat(),
+        "claimed_at": "2026-07-25T00:10:01+00:00",
+        "attempt_count": 1,
+    }
 
 
 def matching_timeline_event(
@@ -235,9 +276,15 @@ class FakeGitHub:
         return self.confirmed_pull
 
     def list_pull_request_label_timeline(
-        self, repository: str, pull_number: int
+        self,
+        repository: str,
+        pull_number: int,
+        *,
+        should_stop=None,
     ) -> object:
         self.timeline_calls += 1
+        if should_stop is not None and should_stop():
+            raise GitHubAPIError("timeline reconciliation stopped")
         if self.timeline_responses:
             return self.timeline_responses.pop(0)
         return self.timeline
@@ -381,52 +428,166 @@ class ApprovalRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(1, len(self.github.created_bodies))
 
-    def test_label_event_uses_authoritative_snapshot_and_bound_policy(self) -> None:
+    def test_target_label_event_is_durably_enqueued_without_github_read(self) -> None:
+        event = label_event()
+
+        with patch.object(
+            self.store,
+            "enqueue_approval_reconciliation",
+            return_value=True,
+        ) as enqueue:
+            result = self.runtime.enqueue_label_event(event, policy=policy())
+
+        self.assertTrue(result)
+        enqueue.assert_called_once_with(
+            event,
+            expected_policy_version="17",
+        )
+        self.assertEqual(0, self.github.timeline_calls)
+        self.assertFalse(self.store.has_delivery(event.delivery_id))
+
+    def test_malformed_signed_label_event_is_not_enqueued(self) -> None:
+        event = label_event(payload_sha256="not-a-sha256")
+
+        with patch.object(
+            self.store,
+            "enqueue_approval_reconciliation",
+        ) as enqueue:
+            with self.assertRaisesRegex(
+                ValueError,
+                "complete signed label evidence",
+            ):
+                self.runtime.enqueue_label_event(event, policy=policy())
+
+        enqueue.assert_not_called()
+        self.assertEqual(0, self.github.timeline_calls)
+
+    def test_reconciliation_defers_zero_then_applies_visible_event_once(self) -> None:
         expected = object()
         event = label_event()
-        self.github.timeline = timeline_snapshot(
-            event, matching_timeline_event(event)
-        )
+        row = reconciliation_row(event)
+        row["expected_policy_version"] = "16"
+        missing = timeline_snapshot(event)
+        visible = timeline_snapshot(event, matching_timeline_event(event))
+        self.github.timeline_responses = [missing, visible]
 
         with patch(
             "reviewer.approval_runtime.process_github_label_approval",
             return_value=expected,
         ) as process:
-            result = self.runtime.process_label_event(event, policy=policy())
+            with self.assertRaises(ApprovalReconciliationPending):
+                self.runtime.process_reconciliation_row(row, policy())
+            result = self.runtime.process_reconciliation_row(row, policy())
 
         self.assertIs(expected, result)
+        self.assertEqual(2, self.github.timeline_calls)
+        self.assertTrue(self.store.has_delivery(event.delivery_id))
         process.assert_called_once_with(
             self.store,
-            snapshot=self.github.timeline,
+            snapshot=visible,
             webhook=event,
             allowed_approver_ids=(303,),
             expected_installation_id=99,
             expected_policy_version="17",
             target_label=APPROVAL_LABEL,
+            evidence_received_at="2026-07-25T00:10:01+00:00",
+            reconciliation_id=1,
+            reconciliation_claimed_at="2026-07-25T00:10:01+00:00",
+            reconciliation_attempt_count=1,
         )
 
-    def test_label_event_retries_until_timeline_event_is_visible(self) -> None:
-        expected = object()
+    def test_reconciliation_archive_does_not_rewind_newer_base_context(self) -> None:
+        current_base_sha = "e" * 40
+        changed = self.store.ingest(
+            replace(
+                pull_event(repository_id=REPOSITORY_ID),
+                delivery_id="delivery-base-change",
+                action="edited",
+                base_sha=current_base_sha,
+            )
+        ).job
+        assert changed is not None
+        changed = self.store.transition(
+            changed.id,
+            ReviewState.REVIEWING,
+            expected=ReviewState.QUEUED,
+        )
+        changed_pull = pull()
+        changed_pull["base"]["sha"] = current_base_sha
+        self.github.confirmed_pull = changed_pull
+        with patch.object(
+            self.github,
+            "get_merge_base_sha",
+            return_value=MERGE_BASE_SHA,
+        ):
+            publication = self.runtime.publish_pass_review(
+                changed,
+                pull=changed_pull,
+                diff="exact current diff",
+                body="review passed",
+                findings_hash="e" * 64,
+                policy=policy(),
+            )
         event = label_event()
-        missing = timeline_snapshot(event)
-        visible = timeline_snapshot(event, matching_timeline_event(event))
-        self.github.timeline_responses = [missing, visible]
+        self.github.timeline = timeline_snapshot(event)
+
+        with self.assertRaises(ApprovalReconciliationPending):
+            self.runtime.process_reconciliation_row(
+                reconciliation_row(event),
+                policy(),
+            )
+
+        persisted = self.store.get_job(REPOSITORY, PULL_NUMBER, HEAD_SHA)
+        assert persisted is not None
+        attempt = self.store.get_review_attempt(
+            publication.attempt.review_context_id
+        )
+        assert attempt is not None
+        self.assertEqual(current_base_sha, persisted.base_sha)
+        self.assertEqual(ReviewState.READY_TO_MERGE, persisted.state)
+        self.assertEqual(ReviewAttemptStatus.ACTIVE, attempt.status)
+        self.assertTrue(self.store.has_delivery(event.delivery_id))
+
+    def test_shutdown_after_exact_timeline_stops_before_installation_or_adapter(
+        self,
+    ) -> None:
+        event = label_event()
+        row = reconciliation_row(event)
+        self.github.timeline = timeline_snapshot(
+            event,
+            matching_timeline_event(event),
+        )
+        stop_requested = MagicMock(side_effect=[False, True])
+        runtime = ApprovalRuntime(
+            self.store,
+            self.github,
+            self.reporter,
+            app_actor=ACTOR,
+            approver_ids=(303,),
+            approval_label=APPROVAL_LABEL,
+            stop_requested=stop_requested,
+        )
 
         with (
-            patch("reviewer.approval_runtime.time.sleep") as sleep,
+            patch.object(
+                self.github,
+                "installation_id_for_repository",
+                return_value=99,
+            ) as installation,
             patch(
-                "reviewer.approval_runtime.process_github_label_approval",
-                return_value=expected,
+                "reviewer.approval_runtime.process_github_label_approval"
             ) as process,
         ):
-            result = self.runtime.process_label_event(event, policy=policy())
+            with self.assertRaisesRegex(
+                ApprovalReconciliationPending,
+                "shutdown requested",
+            ):
+                runtime.process_reconciliation_row(row, policy())
 
-        self.assertIs(expected, result)
-        self.assertEqual(2, self.github.timeline_calls)
-        sleep.assert_called_once_with(
-            LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS[0]
-        )
-        self.assertIs(visible, process.call_args.kwargs["snapshot"])
+        self.assertEqual(1, self.github.timeline_calls)
+        self.assertEqual(2, stop_requested.call_count)
+        installation.assert_not_called()
+        process.assert_not_called()
 
     def test_bot_unlabel_waits_for_visibility_without_rejection_report(self) -> None:
         self.runtime.publish_pass_review(
@@ -440,9 +601,18 @@ class ApprovalRuntimeTests(unittest.TestCase):
         user_event = label_event()
         labeled = matching_timeline_event(user_event)
         self.github.timeline = timeline_snapshot(user_event, labeled)
-        approval = self.runtime.process_label_event(user_event, policy=policy())
+        self.runtime.enqueue_label_event(user_event, policy=policy())
+        user_row = self.store.claim_next_approval_reconciliation()
+        self.assertIsNotNone(user_row)
+        approval = self.runtime.process_reconciliation_row(
+            user_row,
+            policy(),
+        )
         self.assertEqual("ACCEPTED", approval.outcome)
         self.assertEqual(2, len(self.store.list_approval_outbox()))
+        self.assertIsNotNone(
+            self.store.list_approval_reconciliations()[0]["completed_at"]
+        )
 
         bot_event = label_event(
             delivery_id="delivery-bot-unlabel",
@@ -463,63 +633,71 @@ class ApprovalRuntimeTests(unittest.TestCase):
             timeline_snapshot(bot_event, labeled),
             timeline_snapshot(bot_event, labeled, removed),
         ]
+        self.runtime.enqueue_label_event(bot_event, policy=policy())
+        bot_row = self.store.claim_next_approval_reconciliation()
+        self.assertIsNotNone(bot_row)
 
-        with patch("reviewer.approval_runtime.time.sleep") as sleep:
-            result = self.runtime.process_label_event(bot_event, policy=policy())
+        with self.assertRaises(ApprovalReconciliationPending):
+            self.runtime.process_reconciliation_row(
+                bot_row,
+                policy(),
+            )
+        result = self.runtime.process_reconciliation_row(
+            bot_row,
+            policy(),
+        )
 
         self.assertEqual("ACCEPTED", result.outcome)
         self.assertIsNone(result.reason)
         self.assertIsNone(result.approval_id)
         self.assertEqual(2, len(self.store.list_approval_outbox()))
-        sleep.assert_called_once_with(
-            LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS[0]
+        self.assertIsNotNone(
+            self.store.list_approval_reconciliations()[1]["completed_at"]
         )
 
-    def test_label_event_does_not_retry_after_slow_timeline_request(self) -> None:
-        expected = object()
+    def test_deadline_equality_is_terminal_without_github_or_adapter_call(self) -> None:
         event = label_event()
-        slow = timeline_snapshot(event, request_rtt_seconds=2.1)
-        self.github.timeline = slow
+        deadline = datetime(2026, 7, 25, 0, 10, 30, tzinfo=timezone.utc)
+        row = reconciliation_row(event, deadline_at=deadline)
+        self.github.timeline = timeline_snapshot(event)
+        terminal = {
+            "delivery_id": event.delivery_id,
+            "outcome": "REJECTED",
+            "reason": "RECONCILIATION_DEADLINE_EXCEEDED",
+            "event_id": None,
+            "approval_id": None,
+            "generation": None,
+            "attestation_digest": None,
+            "duplicate": False,
+        }
 
         with (
-            patch("reviewer.approval_runtime.time.sleep") as sleep,
+            patch.object(
+                self.store,
+                "reject_timed_out_approval_reconciliation",
+                return_value=terminal,
+            ) as reject,
             patch(
-                "reviewer.approval_runtime.process_github_label_approval",
-                return_value=expected,
+                "reviewer.approval_runtime.process_github_label_approval"
             ) as process,
         ):
-            result = self.runtime.process_label_event(event, policy=policy())
+            result = self.runtime.process_reconciliation_row(
+                row,
+                policy(),
+                now=deadline,
+            )
 
-        self.assertIs(expected, result)
-        self.assertEqual(1, self.github.timeline_calls)
-        sleep.assert_not_called()
-        self.assertIs(slow, process.call_args.kwargs["snapshot"])
-
-    def test_label_event_retry_is_bounded_before_fail_closed_processing(self) -> None:
-        expected = object()
-        event = label_event()
-        missing = timeline_snapshot(event)
-        self.github.timeline = missing
-
-        with (
-            patch("reviewer.approval_runtime.time.sleep") as sleep,
-            patch(
-                "reviewer.approval_runtime.process_github_label_approval",
-                return_value=expected,
-            ) as process,
-        ):
-            result = self.runtime.process_label_event(event, policy=policy())
-
-        self.assertIs(expected, result)
-        self.assertEqual(
-            len(LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS) + 1,
-            self.github.timeline_calls,
+        self.assertEqual("REJECTED", result.outcome)
+        self.assertEqual("RECONCILIATION_DEADLINE_EXCEEDED", result.reason)
+        self.assertEqual(0, self.github.timeline_calls)
+        reject.assert_called_once_with(
+            1,
+            reason="RECONCILIATION_DEADLINE_EXCEEDED",
+            claimed_at="2026-07-25T00:10:01+00:00",
+            attempt_count=1,
+            affects_current=True,
         )
-        self.assertEqual(
-            [call(delay) for delay in LABEL_TIMELINE_RECONCILIATION_DELAYS_SECONDS],
-            sleep.call_args_list,
-        )
-        self.assertIs(missing, process.call_args.kwargs["snapshot"])
+        process.assert_not_called()
 
     def test_bot_cleanup_rejection_report_is_not_user_approval_failure(self) -> None:
         self.runtime.deliver_outbox_row(
@@ -528,7 +706,7 @@ class ApprovalRuntimeTests(unittest.TestCase):
                 "repository": REPOSITORY,
                 "pull_number": PULL_NUMBER,
                 "payload": (
-                    '{"reason":"TIMELINE_EVENT_MATCH_NOT_UNIQUE",'
+                    '{"reason":"TIMELINE_EVENT_VISIBILITY_TIMEOUT",'
                     '"sender_type":"Bot",'
                     '"webhook_action":"unlabeled"}'
                 ),

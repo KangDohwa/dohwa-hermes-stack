@@ -1003,10 +1003,23 @@ class GitHubClient:
         return payload
 
     def list_pull_request_label_timeline(
-        self, repository: str, pull_number: int
+        self,
+        repository: str,
+        pull_number: int,
+        *,
+        should_stop: Callable[[], bool] | None = None,
     ) -> LabelTimelineSnapshot:
         canonical = self.auth.require_allowed_repository(repository)
         number = self._number(pull_number)
+        if should_stop is not None and not callable(should_stop):
+            raise TypeError("should_stop must be callable")
+
+        def require_running() -> None:
+            if should_stop is not None and should_stop():
+                raise GitHubAPIError(
+                    "GitHub label timeline request interrupted"
+                )
+
         owner, name = canonical.split("/", 1)
         query = (
             "query PullRequestLabelTimeline("
@@ -1065,6 +1078,7 @@ class GitHubClient:
         previous_created_at: datetime | None = None
 
         for _page in range(100):
+            require_running()
             data = self._graphql(
                 canonical,
                 query,
@@ -1167,6 +1181,7 @@ class GitHubClient:
                 "GitHub label timeline count does not match its events"
             )
 
+        require_running()
         watermark_data, clock = self._graphql_observed(
             canonical,
             query,
@@ -1214,6 +1229,7 @@ class GitHubClient:
                 identity=identity,
                 timeline_identity=timeline_identity,
                 events=events,
+                should_stop=should_stop,
             )
 
         return LabelTimelineSnapshot(
@@ -1238,11 +1254,16 @@ class GitHubClient:
         identity: tuple[str, int, str, int],
         timeline_identity: tuple[str, int],
         events: Sequence[LabelTimelineEvent],
+        should_stop: Callable[[], bool] | None,
     ) -> GitHubClockObservation:
         cursor: str | None = None
         event_index = 0
         observation: GitHubClockObservation | None = None
         for _page in range(100):
+            if should_stop is not None and should_stop():
+                raise GitHubAPIError(
+                    "GitHub label timeline request interrupted"
+                )
             data, observation = self._graphql_observed(
                 canonical,
                 query,

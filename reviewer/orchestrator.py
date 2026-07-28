@@ -13,7 +13,10 @@ import uuid
 
 from fastapi import FastAPI, HTTPException, Request, Response
 
-from reviewer.approval_runtime import ApprovalRuntime
+from reviewer.approval_runtime import (
+    ApprovalReconciliationPending,
+    ApprovalRuntime,
+)
 from reviewer.config import Settings
 from reviewer.decision import (
     ci_satisfies_policy,
@@ -78,6 +81,7 @@ class ReviewerRuntime:
             github = GitHubClient(auth)
         self.github = github
         self.reporter = reporter or DiscordReporter(settings.discord_webhook_url)
+        self._stop = asyncio.Event()
         self.approval_runtime = ApprovalRuntime(
             self.store,
             self.github,
@@ -85,11 +89,12 @@ class ReviewerRuntime:
             app_actor=f"{settings.app_slug}[bot]",
             approver_ids=settings.approver_ids,
             approval_label=settings.approval_label,
+            stop_requested=lambda: self._stop.is_set(),
         )
-        self._stop = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
         self._reconciler: asyncio.Task[None] | None = None
         self._bootstrapper: asyncio.Task[None] | None = None
+        self._approval_reconciliation_worker: asyncio.Task[None] | None = None
         self._approval_outbox_sender: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -97,6 +102,10 @@ class ReviewerRuntime:
         self._worker = asyncio.create_task(self._worker_loop(), name="review-worker")
         self._reconciler = asyncio.create_task(self._reconcile_loop(), name="review-reconciler")
         self._bootstrapper = asyncio.create_task(self._bootstrap_open_pulls(), name="review-bootstrap")
+        self._approval_reconciliation_worker = asyncio.create_task(
+            self._approval_reconciliation_loop(),
+            name="approval-reconciliation",
+        )
         self._approval_outbox_sender = asyncio.create_task(
             self._approval_outbox_loop(),
             name="approval-outbox",
@@ -104,6 +113,7 @@ class ReviewerRuntime:
 
     async def stop(self) -> None:
         self._stop.set()
+        approval_worker = self._approval_reconciliation_worker
         tasks = [
             task
             for task in (
@@ -117,6 +127,8 @@ class ReviewerRuntime:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if approval_worker is not None:
+            await approval_worker
         self.store.close()
 
     async def _bootstrap_open_pulls(self) -> None:
@@ -161,6 +173,73 @@ class ReviewerRuntime:
                     await asyncio.to_thread(self.store.ingest, event)
             except Exception:
                 LOGGER.exception("open pull bootstrap failed for %s", repository)
+
+    async def _approval_reconciliation_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                row = await asyncio.to_thread(
+                    self.store.claim_next_approval_reconciliation
+                )
+            except Exception:
+                LOGGER.exception("approval reconciliation claim failed")
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=2)
+                except TimeoutError:
+                    pass
+                continue
+            if row is None:
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=1)
+                except TimeoutError:
+                    pass
+                continue
+            try:
+                if self.settings.mode not in {"draft", "auto"}:
+                    raise ApprovalReconciliationPending(
+                        "approval reconciliation mode is inactive"
+                    )
+                await asyncio.to_thread(
+                    self.approval_runtime.process_reconciliation_row,
+                    row,
+                    policy=self.policies[str(row["repository"])],
+                )
+            except Exception as exc:
+                if not isinstance(exc, ApprovalReconciliationPending):
+                    LOGGER.exception(
+                        "approval reconciliation %s failed", row["id"]
+                    )
+                try:
+                    if self.approval_runtime.reconciliation_deadline_expired(row):
+                        await asyncio.to_thread(
+                            self.approval_runtime.reject_reconciliation_after_error,
+                            row,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            self.store.retry_approval_reconciliation,
+                            row["id"],
+                            f"{type(exc).__name__}: {exc}",
+                            claimed_at=row["claimed_at"],
+                            attempt_count=row["attempt_count"],
+                        )
+                except Exception:
+                    LOGGER.exception(
+                        "could not persist approval reconciliation %s result",
+                        row["id"],
+                    )
+            else:
+                try:
+                    await asyncio.to_thread(
+                        self.store.complete_approval_reconciliation,
+                        row["id"],
+                        claimed_at=row["claimed_at"],
+                        attempt_count=row["attempt_count"],
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "could not persist approval reconciliation %s completion",
+                        row["id"],
+                    )
 
     async def _approval_outbox_loop(self) -> None:
         while not self._stop.is_set():
@@ -591,10 +670,11 @@ class ReviewerRuntime:
             and event.repository in self.policies
         ):
             await asyncio.to_thread(
-                self.approval_runtime.process_label_event,
+                self.approval_runtime.enqueue_label_event,
                 event,
                 policy=self.policies[event.repository],
             )
+            return
         await asyncio.to_thread(self.store.ingest, event)
 
     def _transition_after_draft_confirmation(
