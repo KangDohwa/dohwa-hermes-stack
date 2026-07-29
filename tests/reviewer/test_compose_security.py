@@ -1,4 +1,7 @@
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -160,24 +163,110 @@ class DockerBuildContextTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.lines = {
+        cls.lines = [
             line.strip()
             for line in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
-        }
+        ]
+        cls.line_set = set(cls.lines)
 
     def test_context_is_deny_by_default(self) -> None:
-        self.assertIn("*", self.lines)
-        self.assertIn("!Dockerfile.hermes", self.lines)
-        self.assertIn("!reviewer/**", self.lines)
-        self.assertIn("!overlays/discord_presence.py", self.lines)
-        self.assertIn("!patches/discord-dynamic-presence.patch", self.lines)
-        self.assertNotIn("!patches/discord-strict-shared-mentions.patch", self.lines)
+        self.assertIn("*", self.line_set)
+        self.assertIn("!Dockerfile.hermes", self.line_set)
+        self.assertIn("!reviewer/**", self.line_set)
+        self.assertIn("!overlays/discord_presence.py", self.line_set)
+        self.assertIn("!patches/discord-dynamic-presence.patch", self.line_set)
+        self.assertNotIn("!patches/discord-strict-shared-mentions.patch", self.line_set)
+
+    def test_candidate_probe_is_only_ci_build_context_file(self) -> None:
+        fence = [
+            "!ci/",
+            "ci/**",
+            "!ci/candidate-sandbox/",
+            "ci/candidate-sandbox/**",
+            "!ci/candidate-sandbox/v1/",
+            "ci/candidate-sandbox/v1/**",
+            "!ci/candidate-sandbox/v1/probe_runtime.py",
+        ]
+        start = self.lines.index("!ci/")
+        self.assertEqual(
+            fence,
+            self.lines[start : start + len(fence)],
+        )
+
+    def test_docker_context_contains_only_candidate_probe_under_ci(self) -> None:
+        if shutil.which("docker") is None:
+            self.skipTest("Docker CLI unavailable; ordered fence contract checked separately")
+        if subprocess.run(
+            ["docker", "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode:
+            self.skipTest("Docker daemon unavailable; ordered fence contract checked separately")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            dockerfile = temporary_path / "Dockerfile"
+            output = temporary_path / "output"
+            dockerfile.write_text("FROM scratch\nCOPY . /context/\n", encoding="utf-8")
+            output.mkdir()
+            subprocess.run(
+                [
+                    "docker",
+                    "build",
+                    "--no-cache",
+                    "--output",
+                    f"type=local,dest={output}",
+                    "--file",
+                    str(dockerfile),
+                    str(ROOT),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            context = output / "context"
+            context_files = [
+                path.relative_to(context)
+                for path in context.rglob("*")
+                if path.is_file()
+            ]
+            ci_files = sorted(
+                path.as_posix() for path in context_files if path.parts[0] == "ci"
+            )
+            self.assertEqual(
+                ["ci/candidate-sandbox/v1/probe_runtime.py"],
+                ci_files,
+            )
+            for name in ("data", "workspace", "backups", ".git", ".github"):
+                with self.subTest(path=name):
+                    self.assertFalse((context / name).exists())
+            for path in context_files:
+                with self.subTest(path=path):
+                    self.assertFalse({"spool", "sessions", "tokens"} & set(path.parts))
+                    self.assertNotIn(path.name, {".env", "auth.json", "token"})
+                    self.assertFalse(path.name.startswith(".env."))
+                    self.assertNotIn(
+                        path.suffix,
+                        {".db", ".key", ".log", ".pem", ".sqlite", ".sqlite3", ".token"},
+                    )
+
+    def test_candidate_useradd_is_absolute_under_restricted_path(self) -> None:
+        contents = (
+            ROOT / "ci" / "candidate-sandbox" / "v1" / "Containerfile"
+        ).read_text(encoding="utf-8")
+        path_value = next(
+            line.split()[0]
+            for line in contents.splitlines()
+            if line.strip().startswith("PATH=")
+        )
+        self.assertEqual("PATH=/usr/local/bin:/usr/bin:/bin", path_value)
+        self.assertIn("&& /usr/sbin/useradd --uid 65532", contents)
 
     def test_runtime_and_vcs_state_are_excluded(self) -> None:
         for pattern in ("data/", "workspace/", "backups/", ".git/", ".github/"):
             with self.subTest(pattern=pattern):
-                self.assertIn(pattern, self.lines)
+                self.assertIn(pattern, self.line_set)
 
     def test_credentials_and_generated_files_are_excluded(self) -> None:
         for pattern in (
@@ -191,7 +280,7 @@ class DockerBuildContextTests(unittest.TestCase):
             "**/*.py[cod]",
         ):
             with self.subTest(pattern=pattern):
-                self.assertIn(pattern, self.lines)
+                self.assertIn(pattern, self.line_set)
 
 
 class GatewayImageContractTests(unittest.TestCase):
