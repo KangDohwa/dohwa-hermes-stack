@@ -95,6 +95,7 @@ The repository's local tests can be run with:
 
 ```bash
 python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests/reviewer -v
 ```
 
 The candidate-CI tests verify the fail-closed foundation. Passing them does not
