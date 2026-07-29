@@ -18,6 +18,14 @@
 !reviewer/
 !reviewer/**
 
+!ci/
+ci/**
+!ci/candidate-sandbox/
+ci/candidate-sandbox/**
+!ci/candidate-sandbox/v1/
+ci/candidate-sandbox/v1/**
+!ci/candidate-sandbox/v1/probe_runtime.py
+
 # Never send local runtime state, credentials, caches, or VCS metadata.
 data/
 workspace/

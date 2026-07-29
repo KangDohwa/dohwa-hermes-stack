@@ -9,7 +9,7 @@ ENV LANG=C.UTF-8 \
 COPY reviewer/requirements.executor.txt /tmp/requirements.txt
 RUN python3 -m pip install --no-cache-dir --disable-pip-version-check -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt \
-    && useradd --uid 65532 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin candidate \
+    && /usr/sbin/useradd --uid 65532 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin candidate \
     && mkdir -p /opt/dohwa/bin \
     && chmod 0755 /opt/dohwa /opt/dohwa/bin
 
