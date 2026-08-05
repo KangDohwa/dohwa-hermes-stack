@@ -1,4 +1,4 @@
-version: 1
+version: 2
 repositories:
   KangDohwa/dohwa-hermes-stack:
     base_branches: [main]
@@ -9,6 +9,7 @@ repositories:
       timeout_minutes: 20
     tests:
       - [python3, -m, unittest, discover, -s, tests, -v]
+      - [python3, -m, unittest, discover, -s, tests/reviewer, -v]
     required_checks: []
     writable_test_paths: []
     high_risk_paths:
